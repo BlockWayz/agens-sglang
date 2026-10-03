@@ -17,6 +17,7 @@ Files added by Blockway (under python/sglang/):
   srt/function_call/agens_detector.py      `agens` tool-call parser
   srt/parser/agens_reasoning.py            `agens` reasoning parser
   srt/sampling/volundr_budget.py           per-request reasoning budget
+  srt/layers/volundr_fused.py              fused Triton decode kernels for Volundr (mHC, BCSA)
 
 Files modified by Blockway (under python/sglang/):
   kernels/ops/speculative/dflash.py
@@ -27,10 +28,12 @@ Files modified by Blockway (under python/sglang/):
   srt/entrypoints/openai/serving_chat.py
   srt/function_call/function_call_parser.py
   srt/layers/attention/flashattention_backend.py
+  srt/layers/attention/flashinfer_backend.py
   srt/layers/attention/hybrid_linear_attn_backend.py
   srt/layers/attention/linear/kernels/kda_triton.py
   srt/layers/rotary_embedding/mrope_rope_index.py
   srt/managers/tokenizer_manager.py
+  srt/model_executor/runner/decode_cuda_graph_runner.py
   srt/models/dflash.py
   srt/multimodal/processors/qwen_vl.py
   srt/parser/reasoning_parser.py

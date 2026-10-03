@@ -392,6 +392,49 @@ index f552987..2fe9e74 100644
          self.num_splits = (
              1
              if model_runner.server_args.enable_deterministic_inference or fa4_no_splitkv
+diff --git a/python/sglang/srt/layers/attention/flashinfer_backend.py b/python/sglang/srt/layers/attention/flashinfer_backend.py
+index 14b06e7..f5f1736 100644
+--- a/python/sglang/srt/layers/attention/flashinfer_backend.py
++++ b/python/sglang/srt/layers/attention/flashinfer_backend.py
+@@ -285,6 +285,14 @@ def fast_prefill_plan(
+     self._plan_info = self._cached_module.plan(*args)
+ 
+ 
++# Set by the decode CUDA-graph runner while it captures a model's per-batch-size graph variants
++# (Volundr's BCSA far/near graphs). _prepare_cuda_graph_metadata normally builds new wrappers on every
++# capture of a batch size and every replay plans only the newest ones; with two graphs per batch size
++# the first would replay against wrappers nobody re-plans. Under the flag a second capture reuses the
++# existing wrappers, so both graphs read the buffers the per-replay plan refreshes.
++_REUSE_CUDA_GRAPH_WRAPPERS = False
++
++
+ class FlashInferAttnBackend(AttentionBackend):
+     """Flashinfer attention kernels."""
+ 
+@@ -1203,7 +1211,10 @@ class FlashInferAttnBackend(AttentionBackend):
+         spec_info: Optional[SpecInput],
+     ) -> None:
+         if forward_mode.is_decode_or_idle():
+-            decode_wrappers = self._create_decode_wrappers(bs, num_tokens)
++            decode_wrappers = (self.decode_cuda_graph_metadata.get(bs)
++                               if _REUSE_CUDA_GRAPH_WRAPPERS else None)
++            if decode_wrappers is None:
++                decode_wrappers = self._create_decode_wrappers(bs, num_tokens)
+             self.decode_cuda_graph_metadata[bs] = decode_wrappers
+             self.forward_metadata = DecodeMetadata(decode_wrappers)
+         elif forward_mode.is_target_verify() or forward_mode.is_dllm_extend():
+@@ -1212,7 +1223,10 @@ class FlashInferAttnBackend(AttentionBackend):
+                 and spec_info is not None
+                 and getattr(spec_info, "custom_mask", None) is not None
+             )
+-            prefill_wrappers = self._create_prefill_wrappers(bs, use_custom_mask)
++            prefill_wrappers = (self.prefill_cuda_graph_metadata.get(bs)
++                                if _REUSE_CUDA_GRAPH_WRAPPERS else None)
++            if prefill_wrappers is None:
++                prefill_wrappers = self._create_prefill_wrappers(bs, use_custom_mask)
+             self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
+             self.forward_metadata = PrefillMetadata(
+                 prefill_wrappers, forward_mode.is_dllm_extend(), False
 diff --git a/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py b/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
 index d638669..730bd58 100644
 --- a/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
@@ -459,6 +502,498 @@ index 27263c5..11432e1 100644
                  ):
                      t_index = (
                          torch.arange(llm_grid_t, device=position_ids.device)
+diff --git a/python/sglang/srt/layers/volundr_fused.py b/python/sglang/srt/layers/volundr_fused.py
+new file mode 100644
+index 0000000..a758a98
+--- /dev/null
++++ b/python/sglang/srt/layers/volundr_fused.py
+@@ -0,0 +1,486 @@
++"""Fused decode kernels for Volundr: mHC mixing and the BCSA decode block-key write / far branch.
++
++Why. A decode step of Volundr on a 4090 launched ~8,600 kernels, ~6,100 of them for mHC: per layer the
++Sinkhorn projection alone is 10 iterations x (sum, clamp, div) x 2 = 60 one-microsecond kernels over a
++4x4 matrix, plus ~25 more for the pre/post/res bookkeeping, the stream mix and the combine. This module
++replaces them with two Triton kernels per layer:
++
++  mhc_mix      d (the `dyn` projection output) + static params -> pre / post / res (Sinkhorn) and the
++               layer input x_in = sum_s bf16(pre_s * H_s)
++  mhc_combine  H_out = bf16(mixed + bf16(post * bf16(y - x_in))), plus the NEXT layer's H.mean(1)
++
++What is NOT replaced: the RMSNorm, the `dyn` GEMM and the stream-mixing bmm (torch.einsum on bf16 =
++cuBLAS tensor-core MMA, whose internal accumulation a scalar kernel would not reproduce bit-for-bit).
++
++Bit-exactness is the design constraint, not an afterthought. Every rounding step of the torch reference
++is reproduced in the same order:
++  * fp32 adds of static params and deltas; exp via libdevice (the same __nv_expf torch's exp kernel
++    compiles to); IEEE division (div_rn); clamp_min(1e-9) as a max with the same fp32 constant
++  * torch's reduction order for a 4-element sum: sum(-1) is a 4-lane warp-shuffle tree
++    (v0+v2)+(v1+v3), sum(-2) is one thread's serial ((v0+v1)+v2)+v3 (ROW_PAIRWISE / COL_PAIRWISE pick
++    the order; the defaults were selected by bit-exact comparison against torch)
++  * FMA contraction is OFF (enable_fp_fusion=False): with it on, Triton fuses mixed + bf16(post*delta)
++    into one FMA and skips the bf16 rounding of the product torch performs (measured: 20 % of elements
++    one ulp off)
++  * every bf16 intermediate torch materialises (pre.to(bf16), each pre_s * H_s product, y - x_in,
++    post * delta, the final add, the mean) is rounded to bf16 at the same point here.
++"""
++import torch
++import triton
++import triton.language as tl
++from triton.language.extra import libdevice
++
++
++@triton.jit
++def _mhc_mix_kernel(D_ptr, d_stride, PRE_ptr, POST_ptr, RES_ptr,
++                    H_ptr, h_st, h_ss, X_ptr, x_st, POSTO_ptr, RESO_ptr,
++                    DIM, RES32_ptr, ITERS: tl.constexpr, BLOCK: tl.constexpr,
++                    ROW_PAIRWISE: tl.constexpr, COL_PAIRWISE: tl.constexpr, STORE_F32: tl.constexpr):
++    t = tl.program_id(0)
++    pb = tl.program_id(1)
++    drow = D_ptr + t * d_stride
++    # pre = pre_static.float() + d[:, :4]  -> pre.to(bf16)
++    p0 = (tl.load(PRE_ptr + 0).to(tl.float32) + tl.load(drow + 0).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
++    p1 = (tl.load(PRE_ptr + 1).to(tl.float32) + tl.load(drow + 1).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
++    p2 = (tl.load(PRE_ptr + 2).to(tl.float32) + tl.load(drow + 2).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
++    p3 = (tl.load(PRE_ptr + 3).to(tl.float32) + tl.load(drow + 3).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
++    offs = pb * BLOCK + tl.arange(0, BLOCK)
++    msk = offs < DIM
++    hb = H_ptr + t * h_st + offs
++    h0 = tl.load(hb, mask=msk, other=0.0).to(tl.float32)
++    h1 = tl.load(hb + h_ss, mask=msk, other=0.0).to(tl.float32)
++    h2 = tl.load(hb + 2 * h_ss, mask=msk, other=0.0).to(tl.float32)
++    h3 = tl.load(hb + 3 * h_ss, mask=msk, other=0.0).to(tl.float32)
++    # (pre_bf16 * H) is a bf16 tensor in torch: each product rounded, then summed in fp32, serially
++    q0 = (p0 * h0).to(tl.bfloat16).to(tl.float32)
++    q1 = (p1 * h1).to(tl.bfloat16).to(tl.float32)
++    q2 = (p2 * h2).to(tl.bfloat16).to(tl.float32)
++    q3 = (p3 * h3).to(tl.bfloat16).to(tl.float32)
++    x = ((q0 + q1) + q2) + q3
++    tl.store(X_ptr + t * x_st + offs, x.to(tl.bfloat16), mask=msk)
++    if pb == 0:
++        # post = post_static.float() + d[:, 4:8]; only post.to(bf16) is ever consumed
++        prow = POSTO_ptr + t * 4
++        tl.store(prow + 0, (tl.load(POST_ptr + 0).to(tl.float32) + tl.load(drow + 4).to(tl.float32)).to(tl.bfloat16))
++        tl.store(prow + 1, (tl.load(POST_ptr + 1).to(tl.float32) + tl.load(drow + 5).to(tl.float32)).to(tl.bfloat16))
++        tl.store(prow + 2, (tl.load(POST_ptr + 2).to(tl.float32) + tl.load(drow + 6).to(tl.float32)).to(tl.bfloat16))
++        tl.store(prow + 3, (tl.load(POST_ptr + 3).to(tl.float32) + tl.load(drow + 7).to(tl.float32)).to(tl.bfloat16))
++        # logits = res_static + d[8:], fp32 (exactly torch's res_static.float() + d.float())
++        l00 = tl.load(RES_ptr + 0).to(tl.float32) + tl.load(drow + 8).to(tl.float32)
++        l01 = tl.load(RES_ptr + 1).to(tl.float32) + tl.load(drow + 9).to(tl.float32)
++        l02 = tl.load(RES_ptr + 2).to(tl.float32) + tl.load(drow + 10).to(tl.float32)
++        l03 = tl.load(RES_ptr + 3).to(tl.float32) + tl.load(drow + 11).to(tl.float32)
++        l10 = tl.load(RES_ptr + 4).to(tl.float32) + tl.load(drow + 12).to(tl.float32)
++        l11 = tl.load(RES_ptr + 5).to(tl.float32) + tl.load(drow + 13).to(tl.float32)
++        l12 = tl.load(RES_ptr + 6).to(tl.float32) + tl.load(drow + 14).to(tl.float32)
++        l13 = tl.load(RES_ptr + 7).to(tl.float32) + tl.load(drow + 15).to(tl.float32)
++        l20 = tl.load(RES_ptr + 8).to(tl.float32) + tl.load(drow + 16).to(tl.float32)
++        l21 = tl.load(RES_ptr + 9).to(tl.float32) + tl.load(drow + 17).to(tl.float32)
++        l22 = tl.load(RES_ptr + 10).to(tl.float32) + tl.load(drow + 18).to(tl.float32)
++        l23 = tl.load(RES_ptr + 11).to(tl.float32) + tl.load(drow + 19).to(tl.float32)
++        l30 = tl.load(RES_ptr + 12).to(tl.float32) + tl.load(drow + 20).to(tl.float32)
++        l31 = tl.load(RES_ptr + 13).to(tl.float32) + tl.load(drow + 21).to(tl.float32)
++        l32 = tl.load(RES_ptr + 14).to(tl.float32) + tl.load(drow + 22).to(tl.float32)
++        l33 = tl.load(RES_ptr + 15).to(tl.float32) + tl.load(drow + 23).to(tl.float32)
++        mx = tl.maximum(tl.maximum(tl.maximum(tl.maximum(tl.maximum(tl.maximum(tl.maximum(tl.maximum(tl.maximum(tl.maximum(tl.maximum(tl.maximum(tl.maximum(tl.maximum(tl.maximum(l00, l01), l02), l03), l10), l11), l12), l13), l20), l21), l22), l23), l30), l31), l32), l33)
++        m00 = libdevice.exp(l00 - mx)
++        m01 = libdevice.exp(l01 - mx)
++        m02 = libdevice.exp(l02 - mx)
++        m03 = libdevice.exp(l03 - mx)
++        m10 = libdevice.exp(l10 - mx)
++        m11 = libdevice.exp(l11 - mx)
++        m12 = libdevice.exp(l12 - mx)
++        m13 = libdevice.exp(l13 - mx)
++        m20 = libdevice.exp(l20 - mx)
++        m21 = libdevice.exp(l21 - mx)
++        m22 = libdevice.exp(l22 - mx)
++        m23 = libdevice.exp(l23 - mx)
++        m30 = libdevice.exp(l30 - mx)
++        m31 = libdevice.exp(l31 - mx)
++        m32 = libdevice.exp(l32 - mx)
++        m33 = libdevice.exp(l33 - mx)
++        for _it in tl.static_range(ITERS):
++            if ROW_PAIRWISE:
++                r0 = (m00 + m02) + (m01 + m03)
++            else:
++                r0 = ((m00 + m01) + m02) + m03
++            r0 = tl.maximum(r0, 1e-9)
++            if ROW_PAIRWISE:
++                r1 = (m10 + m12) + (m11 + m13)
++            else:
++                r1 = ((m10 + m11) + m12) + m13
++            r1 = tl.maximum(r1, 1e-9)
++            if ROW_PAIRWISE:
++                r2 = (m20 + m22) + (m21 + m23)
++            else:
++                r2 = ((m20 + m21) + m22) + m23
++            r2 = tl.maximum(r2, 1e-9)
++            if ROW_PAIRWISE:
++                r3 = (m30 + m32) + (m31 + m33)
++            else:
++                r3 = ((m30 + m31) + m32) + m33
++            r3 = tl.maximum(r3, 1e-9)
++            m00 = libdevice.div_rn(m00, r0)
++            m01 = libdevice.div_rn(m01, r0)
++            m02 = libdevice.div_rn(m02, r0)
++            m03 = libdevice.div_rn(m03, r0)
++            m10 = libdevice.div_rn(m10, r1)
++            m11 = libdevice.div_rn(m11, r1)
++            m12 = libdevice.div_rn(m12, r1)
++            m13 = libdevice.div_rn(m13, r1)
++            m20 = libdevice.div_rn(m20, r2)
++            m21 = libdevice.div_rn(m21, r2)
++            m22 = libdevice.div_rn(m22, r2)
++            m23 = libdevice.div_rn(m23, r2)
++            m30 = libdevice.div_rn(m30, r3)
++            m31 = libdevice.div_rn(m31, r3)
++            m32 = libdevice.div_rn(m32, r3)
++            m33 = libdevice.div_rn(m33, r3)
++            if COL_PAIRWISE:
++                c0 = (m00 + m10) + (m20 + m30)
++            else:
++                c0 = ((m00 + m10) + m20) + m30
++            c0 = tl.maximum(c0, 1e-9)
++            if COL_PAIRWISE:
++                c1 = (m01 + m11) + (m21 + m31)
++            else:
++                c1 = ((m01 + m11) + m21) + m31
++            c1 = tl.maximum(c1, 1e-9)
++            if COL_PAIRWISE:
++                c2 = (m02 + m12) + (m22 + m32)
++            else:
++                c2 = ((m02 + m12) + m22) + m32
++            c2 = tl.maximum(c2, 1e-9)
++            if COL_PAIRWISE:
++                c3 = (m03 + m13) + (m23 + m33)
++            else:
++                c3 = ((m03 + m13) + m23) + m33
++            c3 = tl.maximum(c3, 1e-9)
++            m00 = libdevice.div_rn(m00, c0)
++            m01 = libdevice.div_rn(m01, c1)
++            m02 = libdevice.div_rn(m02, c2)
++            m03 = libdevice.div_rn(m03, c3)
++            m10 = libdevice.div_rn(m10, c0)
++            m11 = libdevice.div_rn(m11, c1)
++            m12 = libdevice.div_rn(m12, c2)
++            m13 = libdevice.div_rn(m13, c3)
++            m20 = libdevice.div_rn(m20, c0)
++            m21 = libdevice.div_rn(m21, c1)
++            m22 = libdevice.div_rn(m22, c2)
++            m23 = libdevice.div_rn(m23, c3)
++            m30 = libdevice.div_rn(m30, c0)
++            m31 = libdevice.div_rn(m31, c1)
++            m32 = libdevice.div_rn(m32, c2)
++            m33 = libdevice.div_rn(m33, c3)
++        rrow = RESO_ptr + t * 16
++        tl.store(rrow + 0, m00.to(tl.bfloat16))
++        tl.store(rrow + 1, m01.to(tl.bfloat16))
++        tl.store(rrow + 2, m02.to(tl.bfloat16))
++        tl.store(rrow + 3, m03.to(tl.bfloat16))
++        tl.store(rrow + 4, m10.to(tl.bfloat16))
++        tl.store(rrow + 5, m11.to(tl.bfloat16))
++        tl.store(rrow + 6, m12.to(tl.bfloat16))
++        tl.store(rrow + 7, m13.to(tl.bfloat16))
++        tl.store(rrow + 8, m20.to(tl.bfloat16))
++        tl.store(rrow + 9, m21.to(tl.bfloat16))
++        tl.store(rrow + 10, m22.to(tl.bfloat16))
++        tl.store(rrow + 11, m23.to(tl.bfloat16))
++        tl.store(rrow + 12, m30.to(tl.bfloat16))
++        tl.store(rrow + 13, m31.to(tl.bfloat16))
++        tl.store(rrow + 14, m32.to(tl.bfloat16))
++        tl.store(rrow + 15, m33.to(tl.bfloat16))
++        if STORE_F32:
++            tl.store(RES32_ptr + t * 16 + 0, m00)
++            tl.store(RES32_ptr + t * 16 + 1, m01)
++            tl.store(RES32_ptr + t * 16 + 2, m02)
++            tl.store(RES32_ptr + t * 16 + 3, m03)
++            tl.store(RES32_ptr + t * 16 + 4, m10)
++            tl.store(RES32_ptr + t * 16 + 5, m11)
++            tl.store(RES32_ptr + t * 16 + 6, m12)
++            tl.store(RES32_ptr + t * 16 + 7, m13)
++            tl.store(RES32_ptr + t * 16 + 8, m20)
++            tl.store(RES32_ptr + t * 16 + 9, m21)
++            tl.store(RES32_ptr + t * 16 + 10, m22)
++            tl.store(RES32_ptr + t * 16 + 11, m23)
++            tl.store(RES32_ptr + t * 16 + 12, m30)
++            tl.store(RES32_ptr + t * 16 + 13, m31)
++            tl.store(RES32_ptr + t * 16 + 14, m32)
++            tl.store(RES32_ptr + t * 16 + 15, m33)
++
++
++@triton.jit
++def _mhc_combine_kernel(M_ptr, m_st, m_ss, POST_ptr, Y_ptr, y_st, X_ptr, x_st,
++                        O_ptr, o_st, o_ss, MEAN_ptr, mean_st, DIM,
++                        BLOCK: tl.constexpr, WRITE_MEAN: tl.constexpr):
++    t = tl.program_id(0)
++    pb = tl.program_id(1)
++    offs = pb * BLOCK + tl.arange(0, BLOCK)
++    msk = offs < DIM
++    y = tl.load(Y_ptr + t * y_st + offs, mask=msk, other=0.0).to(tl.float32)
++    xi = tl.load(X_ptr + t * x_st + offs, mask=msk, other=0.0).to(tl.float32)
++    delta = (y - xi).to(tl.bfloat16).to(tl.float32)                       # y - x_in, a bf16 tensor
++    mb = M_ptr + t * m_st + offs
++    ob = O_ptr + t * o_st + offs
++    w0 = tl.load(POST_ptr + t * 4 + 0).to(tl.float32)
++    w1 = tl.load(POST_ptr + t * 4 + 1).to(tl.float32)
++    w2 = tl.load(POST_ptr + t * 4 + 2).to(tl.float32)
++    w3 = tl.load(POST_ptr + t * 4 + 3).to(tl.float32)
++    o0 = (tl.load(mb, mask=msk, other=0.0).to(tl.float32) + (w0 * delta).to(tl.bfloat16).to(tl.float32)).to(tl.bfloat16)
++    o1 = (tl.load(mb + m_ss, mask=msk, other=0.0).to(tl.float32) + (w1 * delta).to(tl.bfloat16).to(tl.float32)).to(tl.bfloat16)
++    o2 = (tl.load(mb + 2 * m_ss, mask=msk, other=0.0).to(tl.float32) + (w2 * delta).to(tl.bfloat16).to(tl.float32)).to(tl.bfloat16)
++    o3 = (tl.load(mb + 3 * m_ss, mask=msk, other=0.0).to(tl.float32) + (w3 * delta).to(tl.bfloat16).to(tl.float32)).to(tl.bfloat16)
++    tl.store(ob, o0, mask=msk)
++    tl.store(ob + o_ss, o1, mask=msk)
++    tl.store(ob + 2 * o_ss, o2, mask=msk)
++    tl.store(ob + 3 * o_ss, o3, mask=msk)
++    if WRITE_MEAN:
++        # the next layer's H.mean(1): fp32 serial sum, times 0.25, rounded once
++        s = ((o0.to(tl.float32) + o1.to(tl.float32)) + o2.to(tl.float32)) + o3.to(tl.float32)
++        tl.store(MEAN_ptr + t * mean_st + offs, (s * 0.25).to(tl.bfloat16), mask=msk)
++
++
++_BLOCK = 1024
++ROW_PAIRWISE = True      # torch sum(-1) over 4 contiguous fp32: (v0+v2)+(v1+v3) (measured)
++COL_PAIRWISE = False     # torch sum(-2) over 4 strided fp32: one thread, serial
++
++
++def mhc_mix(d, pre_static, post_static, res_static, H, iters,
++            row_pairwise=None, col_pairwise=None, res32=None):
++    """d: [T, 24] (dyn output, bf16), H: [T, 4, DIM] bf16 -> (x_in [T, DIM], post_bf16 [T, 4], res_bf16 [T, 4, 4])."""
++    T, n, DIM = H.shape
++    assert n == 4 and d.shape[-1] == 2 * n + n * n and H.stride(2) == 1 and d.stride(-1) == 1
++    x = torch.empty(T, DIM, dtype=H.dtype, device=H.device)
++    post = torch.empty(T, n, dtype=torch.bfloat16, device=H.device)
++    res = torch.empty(T, n, n, dtype=torch.bfloat16, device=H.device)
++    if T == 0:
++        return x, post, res
++    grid = (T, triton.cdiv(DIM, _BLOCK))
++    _mhc_mix_kernel[grid](d, d.stride(0), pre_static, post_static, res_static,
++                          H, H.stride(0), H.stride(1), x, x.stride(0), post, res, DIM,
++                          res32 if res32 is not None else res, ITERS=iters, BLOCK=_BLOCK,
++                          STORE_F32=res32 is not None,
++                          ROW_PAIRWISE=ROW_PAIRWISE if row_pairwise is None else row_pairwise,
++                          COL_PAIRWISE=COL_PAIRWISE if col_pairwise is None else col_pairwise,
++                          num_warps=4, enable_fp_fusion=False)
++    return x, post, res
++
++
++def mhc_combine(mixed, post_bf16, y, x_in, want_mean: bool):
++    """mixed: [T, 4, DIM] (= einsum(res, H)), post_bf16 [T, 4], y / x_in [T, DIM]
++    -> (H_out [T, 4, DIM], H_out.mean(1) or None)."""
++    T, n, DIM = mixed.shape
++    assert mixed.stride(2) == 1 and y.stride(-1) == 1 and x_in.stride(-1) == 1
++    out = torch.empty(T, n, DIM, dtype=mixed.dtype, device=mixed.device)
++    mean = torch.empty(T, DIM, dtype=mixed.dtype, device=mixed.device) if want_mean else None
++    if T == 0:
++        return out, mean
++    grid = (T, triton.cdiv(DIM, _BLOCK))
++    _mhc_combine_kernel[grid](mixed, mixed.stride(0), mixed.stride(1), post_bf16, y, y.stride(0),
++                              x_in, x_in.stride(0), out, out.stride(0), out.stride(1),
++                              mean if want_mean else out, mean.stride(0) if want_mean else 0, DIM,
++                              BLOCK=_BLOCK, WRITE_MEAN=bool(want_mean), num_warps=4,
++                              enable_fp_fusion=False)
++    return out, mean
++
++
++# ---------------------------------------------------------------- torch references (the plain path)
++def ref_sinkhorn(logits, iters):
++    m = torch.exp(logits.float() - logits.float().amax(dim=(-1, -2), keepdim=True))
++    for _ in range(iters):
++        m = m / m.sum(-1, keepdim=True).clamp_min(1e-9)
++        m = m / m.sum(-2, keepdim=True).clamp_min(1e-9)
++    return m
++
++
++def ref_mix_from_d(d, pre_static, post_static, res_static, H, iters):
++    n = 4
++    d = d.float()
++    pre = pre_static.float() + d[..., :n]
++    post = post_static.float() + d[..., n:2 * n]
++    res = ref_sinkhorn(res_static.float() + d[..., 2 * n:].view(-1, n, n), iters)
++    x_in = (pre.to(H.dtype).unsqueeze(-1) * H).sum(1)
++    return x_in, post, res
++
++
++def ref_combine(H, post, res, delta):
++    mixed = torch.einsum("tij,tjd->tid", res.to(H.dtype), H)
++    return mixed + post.to(H.dtype).unsqueeze(-1) * delta.unsqueeze(1)
++
++
++# ---------------------------------------------------------------- BCSA decode block-key write
++@triton.jit
++def _bcsa_block_keys_decode_kernel(POS_ptr, REQ_ptr, LOC_ptr, R2T_ptr, r2t_w, IDX_ptr, BLK_ptr, hi,
++                                   C: tl.constexpr, DI: tl.constexpr):
++    """One request per program: pool the C indexer keys of the block holding this step's position and
++    write the mean to blk_cache at this step's KV slot if the position closes the block, else to the
++    trash row `hi` — VolundrAttention._write_block_keys (decode branch), op for op."""
++    b = tl.program_id(0)
++    pos = tl.load(POS_ptr + b).to(tl.int64)
++    req = tl.load(REQ_ptr + b).to(tl.int64)
++    base = (pos // C) * C
++    d = tl.arange(0, DI)
++    acc = tl.zeros([DI], dtype=tl.float32)
++    for c in tl.static_range(C):
++        col = tl.minimum(tl.maximum(base + c, 0), r2t_w - 1)
++        slot = tl.load(R2T_ptr + req * r2t_w + col).to(tl.int64)
++        slot = tl.minimum(tl.maximum(slot, 0), hi)
++        acc += tl.load(IDX_ptr + slot * DI + d).to(tl.float32)        # serial fp32 sum, c = 0..C-1
++    pooled = (acc * (1.0 / C)).to(tl.bfloat16)
++    closes = (pos % C) == (C - 1)
++    dst = tl.where(closes, tl.load(LOC_ptr + b).to(tl.int64), hi)
++    tl.store(BLK_ptr + dst * DI + d, pooled)
++
++
++def bcsa_block_keys_decode(positions, req_pool_indices, out_cache_loc, r2t, idx_cache, blk_cache, C):
++    bs = positions.shape[0]
++    if bs == 0:
++        return
++    DI = idx_cache.shape[1]
++    assert idx_cache.is_contiguous() and blk_cache.is_contiguous() and r2t.is_contiguous()
++    assert (C & (C - 1)) == 0, "the 1/C scale must be exact (C a power of two)"
++    _bcsa_block_keys_decode_kernel[(bs,)](positions, req_pool_indices, out_cache_loc, r2t, r2t.shape[1],
++                                          idx_cache, blk_cache, idx_cache.shape[0] - 1, C=C, DI=DI,
++                                          num_warps=1, enable_fp_fusion=False)
++
++
++def ref_block_keys_decode(positions, req_pool_indices, out_cache_loc, r2t, idx_cache, blk_cache, C):
++    """Torch reference: VolundrAttention._write_block_keys, decode branch."""
++    Di = idx_cache.shape[1]
++    hi = int(idx_cache.shape[0]) - 1
++    bs = positions.shape[0]
++    pos = positions.long()
++    reqs = req_pool_indices.long()
++    cols = (pos // C * C)[:, None] + torch.arange(C, device=pos.device)
++    cols.clamp_(0, r2t.shape[1] - 1)
++    slots = r2t.view(-1)[reqs[:, None] * r2t.shape[1] + cols].long().clamp_(0, hi)
++    pooled = idx_cache[slots].view(bs, C, Di).mean(1)
++    closes = (pos % C) == (C - 1)
++    dst = torch.where(closes, out_cache_loc.long(), torch.full_like(pos, hi))
++    blk_cache.index_copy_(0, dst, pooled.to(blk_cache.dtype))
++
++
++# ---------------------------------------------------------------- BCSA decode far branch
++# VolundrAttention._far_sparse keeps its three cuBLAS einsums, its torch.topk (tie-breaking at the 512th
++# block must not move) and its merge (a 512-wide fp32 softmax sum); the index arithmetic and gathers
++# around them -- ~30 small kernels per BCSA layer -- become four Triton kernels, each bit-exact.
++@triton.jit
++def _far_kbi_kernel(POS_ptr, REQ_ptr, R2T_ptr, r2t_w, BLK_ptr, KBI_ptr, VALID_ptr, NB, hi, W,
++                    C: tl.constexpr, DI: tl.constexpr, BLOCK_N: tl.constexpr):
++    """kbi[b, n] = blk_cache[r2t[req, n*C + C-1]] for every far-valid block n, zeros elsewhere (an
++    invalid block's score is overwritten with -inf, so its key row never reaches the output);
++    valid[b, n] = (n+1)*C - 1 <= pos - W."""
++    b = tl.program_id(0)
++    pn = tl.program_id(1)
++    pos = tl.load(POS_ptr + b).to(tl.int64)
++    req = tl.load(REQ_ptr + b).to(tl.int64)
++    n = pn * BLOCK_N + tl.arange(0, BLOCK_N)
++    inb = n < NB
++    num = pos - W - (C - 1)
++    nmax = tl.where(num >= 0, num // C, -1)          # floor division for negative numerators
++    valid = (n.to(tl.int64) <= nmax) & inb
++    slot = tl.load(R2T_ptr + req * r2t_w + n.to(tl.int64) * C + (C - 1), mask=valid, other=0).to(tl.int64)
++    slot = tl.minimum(tl.maximum(slot, 0), hi)
++    d = tl.arange(0, DI)
++    rows = tl.load(BLK_ptr + slot[:, None] * DI + d[None, :], mask=valid[:, None], other=0.0)
++    tl.store(KBI_ptr + (b * NB + n.to(tl.int64))[:, None] * DI + d[None, :], rows, mask=inb[:, None])
++    tl.store(VALID_ptr + b * NB + n, valid.to(tl.int8), mask=inb)
++
++
++@triton.jit
++def _far_score_kernel(E_ptr, VALID_ptr, S_ptr, NB, scale, BLOCK_N: tl.constexpr):
++    """s_idx = (e.mean(1) * scale).masked_fill(~valid, -inf) for e = einsum("bhd,bnd->bhn") [bs, 4, NB]
++    bf16: serial fp32 head sum, x0.25, rounded; x scale in fp32, rounded."""
++    b = tl.program_id(0)
++    pn = tl.program_id(1)
++    n = pn * BLOCK_N + tl.arange(0, BLOCK_N)
++    inb = n < NB
++    base = E_ptr + b * 4 * NB + n
++    e0 = tl.load(base, mask=inb, other=0.0).to(tl.float32)
++    e1 = tl.load(base + NB, mask=inb, other=0.0).to(tl.float32)
++    e2 = tl.load(base + 2 * NB, mask=inb, other=0.0).to(tl.float32)
++    e3 = tl.load(base + 3 * NB, mask=inb, other=0.0).to(tl.float32)
++    m = ((((e0 + e1) + e2) + e3) * 0.25).to(tl.bfloat16).to(tl.float32)
++    s = (m * scale).to(tl.bfloat16)
++    v = tl.load(VALID_ptr + b * NB + n, mask=inb, other=0)
++    s = tl.where(v != 0, s, float("-inf"))
++    tl.store(S_ptr + b * NB + n, s, mask=inb)
++
++
++@triton.jit
++def _far_pool_kernel(TOP_ptr, POS_ptr, REQ_ptr, R2T_ptr, r2t_w, K_ptr, V_ptr, KB_ptr, VB_ptr, OK_ptr,
++                     KSEL, hi, W, C: tl.constexpr, ROW: tl.constexpr):
++    """For selected block t = top[b, j]: kb/vb[b, j] = mean of the C K/V cache rows of block t (serial
++    fp32 sum, x 1/C, rounded) and sel_ok[b, j] = block t is far-valid."""
++    b = tl.program_id(0)
++    j = tl.program_id(1)
++    t = tl.load(TOP_ptr + b * KSEL + j).to(tl.int64)
++    pos = tl.load(POS_ptr + b).to(tl.int64)
++    req = tl.load(REQ_ptr + b).to(tl.int64)
++    num = pos - W - (C - 1)
++    nmax = tl.where(num >= 0, num // C, -1)
++    tl.store(OK_ptr + b * KSEL + j, (t <= nmax).to(tl.int8))
++    r = tl.arange(0, ROW)
++    acck = tl.zeros([ROW], dtype=tl.float32)
++    accv = tl.zeros([ROW], dtype=tl.float32)
++    for c in tl.static_range(C):
++        col = tl.minimum(tl.maximum(t * C + c, 0), r2t_w - 1)
++        slot = tl.load(R2T_ptr + req * r2t_w + col).to(tl.int64)
++        slot = tl.minimum(tl.maximum(slot, 0), hi)
++        acck += tl.load(K_ptr + slot * ROW + r).to(tl.float32)
++        accv += tl.load(V_ptr + slot * ROW + r).to(tl.float32)
++    o = (b * KSEL + j) * ROW + r
++    tl.store(KB_ptr + o, (acck * (1.0 / C)).to(tl.bfloat16))
++    tl.store(VB_ptr + o, (accv * (1.0 / C)).to(tl.bfloat16))
++
++
++@triton.jit
++def _far_sf_kernel(E_ptr, OK_ptr, SF_ptr, H, KSEL, scale, BLOCK: tl.constexpr):
++    """sf = (e * scale).reshape(bs, H, ksel).float().masked_fill(~sel_ok[:, None, :], -inf), e =
++    einsum("bkgd,bnkd->bkgn") bf16 [bs, KV, G, ksel] (contiguous, so [bs, H, ksel])."""
++    b = tl.program_id(0)
++    hp = tl.program_id(1)
++    j = tl.arange(0, BLOCK)
++    inb = j < KSEL
++    e = tl.load(E_ptr + (b * H + hp) * KSEL + j, mask=inb, other=0.0).to(tl.float32)
++    s = (e * scale).to(tl.bfloat16).to(tl.float32)
++    ok = tl.load(OK_ptr + b * KSEL + j, mask=inb, other=0)
++    tl.store(SF_ptr + (b * H + hp) * KSEL + j, tl.where(ok != 0, s, float("-inf")), mask=inb)
++
++
++def far_sparse_fused(attn, hidden_states, qh, o_loc, lse, pos, reqs, kcache, vcache):
++    """Drop-in for VolundrAttention._far_sparse (decode / verify), bit-exact."""
++    C, W, NB = attn.compress, attn.window, attn.max_blocks
++    H, KV, D = attn.num_heads, attn.num_kv_heads, attn.head_dim
++    G = H // KV
++    bs = qh.shape[0]
++    dev = qh.device
++    hi = int(attn.idx_cache.shape[0]) - 1
++    r2t = attn.r2t
++    Di = attn.idx_dim
++    assert (C & (C - 1)) == 0 and attn.idx_heads == 4
++    pos = pos.contiguous()
++    reqs = reqs.contiguous()
++    kbi = torch.empty(bs, NB, Di, dtype=attn.blk_cache.dtype, device=dev)
++    valid = torch.empty(bs, NB, dtype=torch.int8, device=dev)
++    BN = 64
++    _far_kbi_kernel[(bs, triton.cdiv(NB, BN))](pos, reqs, r2t, r2t.shape[1], attn.blk_cache, kbi, valid,
++                                               NB, hi, W, C=C, DI=Di, BLOCK_N=BN, num_warps=4)
++    qi = attn.idx_norm(attn.idx_q(hidden_states)[0].reshape(-1, Di))
++    qi = qi.view(bs, attn.idx_heads, Di)
++    e = torch.einsum("bhd,bnd->bhn", qi, kbi)
++    s_idx = torch.empty(bs, NB, dtype=e.dtype, device=dev)
++    BS = 1024
++    _far_score_kernel[(bs, triton.cdiv(NB, BS))](e, valid, s_idx, NB, float(attn.idx_scale), BLOCK_N=BS,
++                                                 num_warps=4, enable_fp_fusion=False)
++    ksel = min(attn.bcsa_topk, NB)
++    top = s_idx.topk(ksel, dim=-1).indices.contiguous()
++    kb = torch.empty(bs, ksel, KV, D, dtype=kcache.dtype, device=dev)
++    vb = torch.empty(bs, ksel, KV, D, dtype=vcache.dtype, device=dev)
++    sel_ok = torch.empty(bs, ksel, dtype=torch.int8, device=dev)
++    _far_pool_kernel[(bs, ksel)](top, pos, reqs, r2t, r2t.shape[1], kcache, vcache, kb, vb, sel_ok,
++                                 ksel, hi, W, C=C, ROW=KV * D, num_warps=4, enable_fp_fusion=False)
++    e2 = torch.einsum("bkgd,bnkd->bkgn", qh.view(bs, KV, G, D), kb).contiguous()
++    sf = torch.empty(bs, H, ksel, dtype=torch.float32, device=dev)
++    _far_sf_kernel[(bs, H)](e2, sel_ok, sf, H, ksel, float(attn.scaling), BLOCK=triton.next_power_of_2(ksel),
++                            num_warps=4, enable_fp_fusion=False)
++    return attn._merge(sf, lse, o_loc, vb, kv_first=False)
 diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
 index 871f626..f3638d5 100644
 --- a/python/sglang/srt/managers/tokenizer_manager.py
@@ -475,6 +1010,63 @@ index 871f626..f3638d5 100644
              ):
                  raise ValueError(
                      "The server is not configured to enable custom logit processor. "
+diff --git a/python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py b/python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py
+index 69a1c49..e8061bb 100644
+--- a/python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py
++++ b/python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py
+@@ -455,6 +455,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
+         return num_tokens if self.ragged_verify_mode else bs
+ 
+     def _resolve_lora_variant(self, forward_batch: ForwardBatch):
++        # Volundr: BCSA "far" / "near" graph variants (see _capture_one_stream)
++        if getattr(self, "_volundr_variants", None):
++            return self.model_runner.model.bcsa_graph_variant(forward_batch)
+         if not getattr(self, "record_nolora_graph", False):
+             return None
+         if forward_batch.lora_ids is not None and any(
+@@ -892,6 +895,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
+                         with self.backend.capture_session(self.stream):
+                             self._capture_one_stream(i)
+ 
++        if getattr(self, "_volundr_variants", None):
++            self.model_runner.model.set_bcsa_capture_variant(None)
+         if self.enable_profile_cuda_graph:
+             self._post_process_after_profile(prof)
+ 
+@@ -915,6 +920,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
+             if getattr(self, "record_nolora_graph", False)
+             else [(None, None)]
+         )
++        # Volundr captures each decode batch size twice -- "far" (BCSA far field computed) and "near"
++        # (every request inside the BCSA window: far field provably empty, skipped) -- and
++        # _resolve_lora_variant picks one per replay from seq_lens_cpu. Models without
++        # `bcsa_graph_variants` are untouched; LoRA batches keep the LoRA variants.
++        self._volundr_variants = None
++        _vol = getattr(self.model_runner.model, "bcsa_graph_variants", None)
++        if _vol is not None and lora_variants == [(None, None)]:
++            _labels = list(_vol())
++            if _labels:
++                self._volundr_variants = _labels
++                lora_variants = [(_l, None) for _l in _labels]
+         for bs in capture_range:
+             if get_parallel().tp_rank == 0:
+                 avail_mem = get_available_gpu_memory(
+@@ -927,7 +943,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
+                 )
+ 
+             for variant_label, _variant_has_lora in lora_variants:
+-                _set_capture_lora_variant(variant_label)
++                if self._volundr_variants:
++                    _set_capture_lora_variant(None)
++                    self.model_runner.model.set_bcsa_capture_variant(variant_label)
++                    # two graphs per bs must share the attention backend's per-bs cuda-graph wrappers
++                    import sglang.srt.layers.attention.flashinfer_backend as _fi_backend
++                    _fi_backend._REUSE_CUDA_GRAPH_WRAPPERS = True
++                else:
++                    _set_capture_lora_variant(variant_label)
+                 with torch_compile_decoration.patch_model(
+                     self.model_runner.model,
+                     bs in self.compile_bs,
 diff --git a/python/sglang/srt/models/dflash.py b/python/sglang/srt/models/dflash.py
 index ffef278..b7de868 100644
 --- a/python/sglang/srt/models/dflash.py
@@ -1085,10 +1677,10 @@ index ffef278..b7de868 100644
 +]
 diff --git a/python/sglang/srt/models/volundr.py b/python/sglang/srt/models/volundr.py
 new file mode 100644
-index 0000000..cb9270a
+index 0000000..6fa627a
 --- /dev/null
 +++ b/python/sglang/srt/models/volundr.py
-@@ -0,0 +1,1869 @@
+@@ -0,0 +1,1963 @@
 +"""Agens Volundr for SGLang.
 +
 +Volundr is a 72-layer hybrid language model with an optional vision tower:
@@ -1193,6 +1785,30 @@ index 0000000..cb9270a
 +)
 +from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem, MultimodalInputs
 +from sglang.srt.runtime_context import get_server_args
++from sglang.srt.layers.volundr_fused import (
++    bcsa_block_keys_decode,
++    far_sparse_fused,
++    mhc_combine,
++    mhc_mix,
++)
++
++
++def _env_flag(name: str, default: str = "1") -> bool:
++    return os.environ.get(name, default).strip() not in ("0", "false", "False", "")
++
++
++# Decode-speed switches. All default on, and each is bit-exact with the plain torch path it replaces
++# (layers/volundr_fused.py documents the arithmetic rules that make the fused kernels exact).
++#   VOLUNDR_FUSED_MHC=0            mHC as plain torch ops instead of two Triton kernels per layer
++#   VOLUNDR_BCSA_GRAPH_VARIANTS=0  one decode CUDA graph per batch size instead of a "far" and a
++#                                  "near" one (near: every request inside the BCSA window, so the far
++#                                  field is provably empty and skipped)
++#   VOLUNDR_FUSED_BCSA=0           BCSA decode block-key write and far-branch index math / gathers as
++#                                  plain torch ops instead of Triton kernels
++_FUSED_MHC = _env_flag("VOLUNDR_FUSED_MHC")
++_BCSA_GRAPH_VARIANTS = _env_flag("VOLUNDR_BCSA_GRAPH_VARIANTS")
++_FUSED_BCSA = _env_flag("VOLUNDR_FUSED_BCSA")
++_BCSA_CAPTURE_VARIANT = None     # set by the decode graph runner around each capture: None | "far" | "near"
 +
 +
 +# Token ids at or above the tokenizer's length (248,077 for the published checkpoints) are padding rows
@@ -2070,7 +2686,18 @@ index 0000000..cb9270a
 +            nd = int(forward_batch.spec_info.draft_token_num) if is_verify else 1
 +            capturing = torch.cuda.is_current_stream_capturing()
 +            slc = getattr(forward_batch, "seq_lens_cpu", None)
-+            if not capturing and slc is not None and int(slc.max()) + nd - 1 <= self.window:
++            if _BCSA_CAPTURE_VARIANT is not None and _is_capture_mode():
++                # Graph capture (and its eager warmups) of one variant. "near" graphs are replayed only
++                # for batches whose every request is inside the window (the runner checks seq_lens_cpu
++                # per replay, _VolundrLM.bcsa_graph_variant), where the far set is empty; "far" graphs
++                # always compute it.
++                if _BCSA_CAPTURE_VARIANT == "near":
++                    return o_loc.reshape(T, H * D)
++            elif _is_capture_mode():
++                # Capture warmups run the far branch too, so that its Triton kernels are compiled and
++                # loaded before the graph records them; warmup outputs are discarded.
++                pass
++            elif not capturing and slc is not None and int(slc.max()) + nd - 1 <= self.window:
 +                # Eager decode below the window: the far set is provably empty for every request,
 +                # so skip it. During capture this branch is NEVER taken (the graph is replayed at
 +                # sequence lengths the capture never saw), which is why the guard is on `capturing`
@@ -2079,8 +2706,12 @@ index 0000000..cb9270a
 +            reqs = forward_batch.req_pool_indices.long()
 +            if is_verify:
 +                reqs = reqs.repeat_interleave(nd)                              # [bs * D]
-+            out = self._far_sparse(hidden_states, qh, o_loc, lse, positions.long(), reqs,
-+                                   kcache, vcache)
++            if _FUSED_BCSA:
++                out = far_sparse_fused(self, hidden_states, qh, o_loc, lse, positions.long(), reqs,
++                                       kcache, vcache)
++            else:
++                out = self._far_sparse(hidden_states, qh, o_loc, lse, positions.long(), reqs,
++                                       kcache, vcache)
 +        else:
 +            out = self._far_extend(hidden_states, qh, o_loc, lse,
 +                                   forward_batch, kcache, vcache)
@@ -2191,6 +2822,11 @@ index 0000000..cb9270a
 +        hi = int(self.idx_cache.shape[0]) - 1
 +        dev = self.idx_cache.device
 +        if forward_batch.forward_mode.is_decode():
++            if _FUSED_BCSA:
++                bcsa_block_keys_decode(positions, forward_batch.req_pool_indices,
++                                       forward_batch.out_cache_loc, self.r2t, self.idx_cache,
++                                       self.blk_cache, C)
++                return
 +            bs = positions.shape[0]
 +            pos = positions.long()
 +            reqs = forward_batch.req_pool_indices.long()
@@ -2384,6 +3020,19 @@ index 0000000..cb9270a
 +    def combine(self, H: torch.Tensor, post: torch.Tensor, res: torch.Tensor, delta: torch.Tensor):
 +        mixed = torch.einsum("tij,tjd->tid", res.to(H.dtype), H)
 +        return mixed + post.to(H.dtype).unsqueeze(-1) * delta.unsqueeze(1)
++
++    # ---- fused path (layers/volundr_fused.py): the same arithmetic as mix / combine, bit for bit
++    def mix_fused(self, H: torch.Tensor, h_mean: torch.Tensor):
++        """mix() with H.mean(1) supplied (the previous layer's combine_fused computed it). Returns
++        (x_in, post_bf16, res_bf16): only the bf16 casts of post / res are ever consumed."""
++        d = self.dyn(self.norm(h_mean))[0]
++        return mhc_mix(d, self.pre_static, self.post_static, self.res_static, H, self.iters)
++
++    def combine_fused(self, H: torch.Tensor, post_bf16: torch.Tensor, res_bf16: torch.Tensor,
++                      y: torch.Tensor, x_in: torch.Tensor, want_mean: bool):
++        """combine(H, post, res, y - x_in), plus H_out.mean(1) for the next layer's mix_fused."""
++        mixed = torch.einsum("tij,tjd->tid", res_bf16, H)
++        return mhc_combine(mixed, post_bf16, y, x_in, want_mean)
 +
 +
 +# hash constants shared with volundr_extras.Engram — the row index must be bit-identical.
@@ -2688,13 +3337,23 @@ index 0000000..cb9270a
 +        aux = []
 +        if self.streams > 1:
 +            H = hidden_states.unsqueeze(1).expand(-1, self.streams, -1).contiguous()
++            fused = _FUSED_MHC and self.streams == 4
++            h_mean = H.mean(1) if fused else None
++            n_layers = len(self.layers)
 +            for i, layer in enumerate(self.layers):
 +                if cap and i in cap:
 +                    aux.append(H[:, 0, :])                 # residual stream 0 at layer entry
-+                x_in, post, res = self.mhc[i].mix(H)
++                if fused:
++                    x_in, post, res = self.mhc[i].mix_fused(H, h_mean)
++                else:
++                    x_in, post, res = self.mhc[i].mix(H)
 +                y = layer(positions, x_in, forward_batch, engram_rows=engram_rows,
 +                          rope_positions=rope_positions)
-+                H = self.mhc[i].combine(H, post, res, y - x_in)
++                if fused:
++                    H, h_mean = self.mhc[i].combine_fused(H, post, res, y, x_in,
++                                                          want_mean=i + 1 < n_layers)
++                else:
++                    H = self.mhc[i].combine(H, post, res, y - x_in)
 +            hidden_states = H[:, 0, :]
 +        else:
 +            for i, layer in enumerate(self.layers):
@@ -2774,6 +3433,33 @@ index 0000000..cb9270a
 +    def commit_after_verify(self, last_correct_step_indices: torch.Tensor, slots: torch.Tensor):
 +        """Post-verify commit hook (see VolundrModel.commit_after_verify)."""
 +        self.model.commit_after_verify(last_correct_step_indices, slots)
++
++    # ---- BCSA far/near decode-graph variants (driven by the decode CUDA-graph runner)
++    def bcsa_graph_variants(self):
++        """Variant labels to capture per decode batch size: ["far", "near"], or [] for one graph."""
++        c = _text_cfg(self.config)
++        has_bcsa = any(_mixer_kind(c, i) == "bcsa" for i in range(c.num_hidden_layers))
++        return ["far", "near"] if (_BCSA_GRAPH_VARIANTS and has_bcsa) else []
++
++    def set_bcsa_capture_variant(self, label) -> None:
++        global _BCSA_CAPTURE_VARIANT
++        _BCSA_CAPTURE_VARIANT = label
++
++    def bcsa_graph_variant(self, forward_batch) -> str:
++        """Per replay: "near" iff every request of the batch is inside the BCSA window — the same
++        condition (and the same margin: the far set is non-empty only from position W + C - 1)
++        under which the eager decode path skips the far branch."""
++        slc = getattr(forward_batch, "seq_lens_cpu", None)
++        if slc is None or slc.numel() == 0:
++            return "far"
++        mode = forward_batch.forward_mode
++        nd = 1
++        if mode.is_target_verify():
++            nd = int(getattr(forward_batch.spec_info, "draft_token_num", 0) or 0)
++            if nd <= 0:
++                return "far"
++        window = int(getattr(_text_cfg(self.config), "bcsa_window", 4096) or 4096)
++        return "near" if int(slc.max()) + nd - 1 <= window else "far"
 +
 +    def get_input_embeddings(self):
 +        return self.model.embed_tokens

@@ -148,14 +148,27 @@ curl -s http://127.0.0.1:30000/v1/chat/completions -H 'Content-Type: application
     {"type": "text", "text": "What is in this picture?"}]}]
 ```
 
-Token ids at or above 248,077 (beyond the tokenizer's vocabulary) are masked out of sampling; set
-`VOLUNDR_MASK_UNUSED_TOKENS=0` on the server to disable.
 
 `examples/smoke_test.py --base-url http://127.0.0.1:30000` runs all of the above against a server
 (add `--image-url URL` for the image check and `--speed` for a decode-speed estimate).
 
 Setting the environment variable `VOLUNDR_REASONING_BUDGET=N` on the server applies a default budget
 to every chat request that does not set its own.
+
+## Server environment variables
+
+All default on; set to `0` on the server (`docker run -e NAME=0 ...`) to turn one off.
+
+| variable | effect |
+|---|---|
+| `VOLUNDR_FUSED_MHC` | mHC mixing as two fused Triton kernels per layer instead of ~85 small torch ops |
+| `VOLUNDR_BCSA_GRAPH_VARIANTS` | two decode CUDA graphs per batch size: "near" (every request inside the 4,096-token BCSA window, far field skipped) and "far" |
+| `VOLUNDR_FUSED_BCSA` | BCSA decode block-key write and far-branch index math / gathers as fused Triton kernels |
+| `VOLUNDR_MASK_UNUSED_TOKENS` | token ids at or above 248,077 (beyond the tokenizer's vocabulary) are masked out of sampling |
+
+The first three only change speed: each is bit-exact with the plain torch path it replaces, and greedy
+output is token-identical with them on or off. `VOLUNDR_REASONING_BUDGET=N` sets a default reasoning
+budget (see above).
 
 ## Required flags
 
