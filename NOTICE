@@ -1,0 +1,43 @@
+Agens SGLang
+Copyright 2026 Blockway
+
+This repository contains a modified version of SGLang (https://github.com/sgl-project/sglang),
+Copyright the SGLang authors, licensed under the Apache License, Version 2.0. A copy of the licence
+is included as LICENSE.
+
+The modifications are distributed as patches/agens-volundr.patch, which applies to SGLang commit
+4051b19cc2cd7fd8903ceec1d084a69b56c6df4d. The container images built from docker/Dockerfile contain
+SGLang at that commit with the patch applied, installed over the official lmsysorg/sglang:v0.5.16
+runtime image. The DFlash2 drafter support (DFlash2DraftModel, its candidate selector and grouped
+convolutions) is adapted from later upstream SGLang sources, also Apache-2.0.
+
+Files added by Blockway (under python/sglang/):
+  srt/models/volundr.py                    Agens Volundr model classes (KDA, BCSA, Engram, mHC, vision)
+  srt/configs/volundr_cfg.py               Volundr config classes
+  srt/function_call/agens_detector.py      `agens` tool-call parser
+  srt/parser/agens_reasoning.py            `agens` reasoning parser
+  srt/sampling/volundr_budget.py           per-request reasoning budget
+
+Files modified by Blockway (under python/sglang/):
+  kernels/ops/speculative/dflash.py
+  srt/configs/__init__.py
+  srt/configs/hybrid_arch.py
+  srt/configs/model_config.py
+  srt/entrypoints/openai/protocol.py
+  srt/entrypoints/openai/serving_chat.py
+  srt/function_call/function_call_parser.py
+  srt/layers/attention/flashattention_backend.py
+  srt/layers/attention/hybrid_linear_attn_backend.py
+  srt/layers/attention/linear/kernels/kda_triton.py
+  srt/layers/rotary_embedding/mrope_rope_index.py
+  srt/managers/tokenizer_manager.py
+  srt/models/dflash.py
+  srt/multimodal/processors/qwen_vl.py
+  srt/parser/reasoning_parser.py
+  srt/sampling/sampling_batch_info.py
+  srt/speculative/dflash_utils.py
+  srt/speculative/dflash_worker_v2.py
+  srt/utils/hf_transformers/common.py
+  srt/utils/hf_transformers/config.py
+  srt/utils/hf_transformers/processor.py
+  srt/utils/hf_transformers/tokenizer.py
