@@ -108,7 +108,6 @@ slots. Two 48 GB GPUs, text requests only (no `--enable-multimodal`):
 docker run --rm --gpus '"device=0,1"' --ipc=host --network host --shm-size 32g \
   -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
-  -v /path/to/drafter:/models/drafter:ro \
   ghcr.io/blockwayz/agens-sglang:preview-sm89 \
   python3 -m sglang.launch_server \
     --model-path Blockway/Agens-Volundr-32B-Preview \
@@ -116,13 +115,14 @@ docker run --rm --gpus '"device=0,1"' --ipc=host --network host --shm-size 32g \
     --disable-radix-cache --disable-prefill-cuda-graph --disable-custom-all-reduce \
     --mem-fraction-static 0.90 --context-length 16384 --chunked-prefill-size 2048 \
     --max-mamba-cache-size 4 --max-running-requests 4 --cuda-graph-max-bs 4 \
-    --speculative-algorithm DFLASH --speculative-draft-model-path /models/drafter \
+    --speculative-algorithm DFLASH --speculative-draft-model-path Blockway/Agens-Volundr-32B-Preview-DFlash2 \
     --speculative-num-draft-tokens 8 --speculative-draft-model-quantization unquant \
     --reasoning-parser agens --tool-call-parser agens \
     --host 127.0.0.1 --port 30000
 ```
 
-The drafter and its speculative state take memory from the KV cache: this configuration leaves about
+The drafter is [`Blockway/Agens-Volundr-32B-Preview-DFlash2`](https://huggingface.co/Blockway/Agens-Volundr-32B-Preview-DFlash2)
+(3.8 GB; it shares the target's embeddings and output head). The drafter and its speculative state take memory from the KV cache: this configuration leaves about
 18K tokens of KV cache on two 48 GB cards, and the smaller prefill chunks plus
 `expandable_segments` keep long-prompt prefill inside the remaining headroom. Speculative decoding needs
 `--attention-backend flashinfer` on every GPU (the BCSA verify step is implemented there) and is served
