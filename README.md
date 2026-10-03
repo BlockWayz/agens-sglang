@@ -98,25 +98,53 @@ The model supports up to 262,144 tokens of context; a longer `--context-length` 
 concurrent requests. Each BCSA layer keeps a small per-token indexer-key cache that is allocated after
 SGLang sizes the KV pool, which is why `--mem-fraction-static` is lower than SGLang's default.
 
-### Speculative decoding with the DFlash2 drafter
+### Speculative decoding with the DFlash2 drafter (single user)
 
-Add these flags to the two-GPU bf16 command above (text requests only — leave out
-`--enable-multimodal`):
+The DFlash2 drafter speeds up a single user's stream; it is not a throughput option. With 8 concurrent
+distinct requests a drafter server is slower than plain decoding, partly because it runs only 4 request
+slots. Two 48 GB GPUs, text requests only (no `--enable-multimodal`):
 
 ```bash
-    --speculative-algorithm DFLASH \
-    --speculative-draft-model-path <drafter checkpoint> \
-    --speculative-num-draft-tokens 8 \
-    --speculative-draft-model-quantization unquant \
-    --mem-fraction-static 0.93 --max-mamba-cache-size 4 --max-running-requests 4 --cuda-graph-max-bs 4
+docker run --rm --gpus '"device=0,1"' --ipc=host --network host --shm-size 32g \
+  -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  -v /path/to/drafter:/models/drafter:ro \
+  ghcr.io/blockwayz/agens-sglang:preview-sm89 \
+  python3 -m sglang.launch_server \
+    --model-path Blockway/Agens-Volundr-32B-Preview \
+    --tp-size 2 --attention-backend flashinfer --page-size 1 \
+    --disable-radix-cache --disable-prefill-cuda-graph --disable-custom-all-reduce \
+    --mem-fraction-static 0.90 --context-length 16384 --chunked-prefill-size 2048 \
+    --max-mamba-cache-size 4 --max-running-requests 4 --cuda-graph-max-bs 4 \
+    --speculative-algorithm DFLASH --speculative-draft-model-path /models/drafter \
+    --speculative-num-draft-tokens 8 --speculative-draft-model-quantization unquant \
+    --reasoning-parser agens --tool-call-parser agens \
+    --host 127.0.0.1 --port 30000
 ```
 
-(The drafter and its speculative state take memory from the KV cache; the slot counts above fit two
-48 GB cards.)
+The drafter and its speculative state take memory from the KV cache: this configuration leaves about
+18K tokens of KV cache on two 48 GB cards, and the smaller prefill chunks plus
+`expandable_segments` keep long-prompt prefill inside the remaining headroom. Speculative decoding needs
+`--attention-backend flashinfer` on every GPU (the BCSA verify step is implemented there) and is served
+as a chain (top-k 1). The gain is largest on predictable output (code, JSON).
 
-Speculative decoding needs `--attention-backend flashinfer` on every GPU (the BCSA verify step is
-implemented there) and is served as a chain (top-k 1). The gain is largest at batch size 1 and on
-predictable output (code, JSON); at batch 8 it is roughly neutral.
+## Performance
+
+Measured with this image on 48 GB Ada GPUs (single stream: 256 new tokens after a prompt of the given
+length; batch: N concurrent 1K-token prompts, aggregate output rate including their prefill).
+
+| | prompt 1K | 8K | 32K | 64K | 128K | batch 8 | batch 16 |
+|---|---|---|---|---|---|---|---|
+| bf16, 2 GPUs — decode tok/s | 25.1 | 24.1 | 24.1 | 24.0 | 23.9 | 127 | 130 |
+| bf16, 2 GPUs — prefill tok/s | 2,122 | 2,180 | 1,916 | 1,679 | 1,297 | | |
+| INT4, 1 GPU — decode tok/s | 31.0 | 29.3 | 29.1 | | | 117 | |
+| INT4, 1 GPU — prefill tok/s | 2,236 | 2,200 | 1,764 | | | | |
+| bf16 + DFlash2 drafter, 2 GPUs — decode tok/s | code 56, JSON 76, prose 32 | | | | | | |
+
+64K / 128K use a long-context server (`--context-length 140000 --mem-fraction-static 0.90
+--chunked-prefill-size 2048`, one request slot). INT4 batch 8 uses `--max-running-requests 9
+--max-mamba-cache-size 9` so that 8 requests run at once (with 8 / 8 one slot stays in reserve and the
+8th request waits).
 
 ## Using the API
 
