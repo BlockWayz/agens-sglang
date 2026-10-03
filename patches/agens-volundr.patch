@@ -1085,10 +1085,10 @@ index ffef278..b7de868 100644
 +]
 diff --git a/python/sglang/srt/models/volundr.py b/python/sglang/srt/models/volundr.py
 new file mode 100644
-index 0000000..bd16d96
+index 0000000..cb9270a
 --- /dev/null
 +++ b/python/sglang/srt/models/volundr.py
-@@ -0,0 +1,1850 @@
+@@ -0,0 +1,1869 @@
 +"""Agens Volundr for SGLang.
 +
 +Volundr is a 72-layer hybrid language model with an optional vision tower:
@@ -1193,6 +1193,24 @@ index 0000000..bd16d96
 +)
 +from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem, MultimodalInputs
 +from sglang.srt.runtime_context import get_server_args
++
++
++# Token ids at or above the tokenizer's length (248,077 for the published checkpoints) are padding rows
++# of the embedding and lm_head. They can still receive probability mass (notably a retired tool-call
++# id, which competes with <|call|> when sampling), and a sampled one cannot be detokenized, so their
++# logits are masked. VOLUNDR_MASK_UNUSED_TOKENS=0 turns this off.
++_UNUSED_TOKEN_START = int(os.environ.get("VOLUNDR_UNUSED_TOKEN_START", "248077"))
++_MASK_UNUSED_TOKENS = os.environ.get("VOLUNDR_MASK_UNUSED_TOKENS", "1").strip() != "0"
++
++
++def _mask_unused_tokens(out):
++    """Set the logits of token ids the tokenizer does not define to -inf (in place)."""
++    if not _MASK_UNUSED_TOKENS:
++        return out
++    logits = getattr(out, "next_token_logits", None)
++    if logits is not None and logits.shape[-1] > _UNUSED_TOKEN_START:
++        logits[..., _UNUSED_TOKEN_START:] = float("-inf")
++    return out
 +
 +
 +def _text_cfg(config):
@@ -2766,8 +2784,8 @@ index 0000000..bd16d96
 +        aux_hidden_states = None
 +        if self.capture_aux_hidden_states:
 +            hidden_states, aux_hidden_states = hidden_states
-+        return self.logits_processor(input_ids, hidden_states, self.lm_head, forward_batch,
-+                                     aux_hidden_states)
++        return _mask_unused_tokens(self.logits_processor(
++            input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states))
 +
 +    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
 +        stacked = [("gate_up_proj", "gate_proj", 0), ("gate_up_proj", "up_proj", 1)]
@@ -2913,7 +2931,8 @@ index 0000000..bd16d96
 +            input_ids=input_ids, forward_batch=forward_batch, language_model=self.model,
 +            multimodal_model=self, positions=positions, rope_positions=rope_positions,
 +            token_ids=token_ids, use_deepstack=self.use_deepstack)
-+        return self.logits_processor(input_ids, hidden_states, self.lm_head, forward_batch)
++        return _mask_unused_tokens(
++            self.logits_processor(input_ids, hidden_states, self.lm_head, forward_batch))
 +
 +    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
 +        """Vision tensors go to self.visual (sglang's VisionAttention names the fused projection

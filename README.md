@@ -37,7 +37,7 @@ plus the Dockerfile that builds the serving images. Prebuilt images:
 ## Quick start
 
 All commands mount the Hugging Face cache so the weights are downloaded once. The required flags are
-explained [below](#required-flags); the server refuses to start without them.
+explained [below](#required-flags); the server checks the Volundr-specific ones at startup.
 
 ### bf16 on two 48 GB GPUs (sm89, tensor parallel 2)
 
@@ -55,7 +55,8 @@ docker run --rm --gpus '"device=0,1"' --ipc=host --network host --shm-size 32g \
     --host 127.0.0.1 --port 30000
 ```
 
-Add `--enable-multimodal` to accept images.
+Add `--enable-multimodal --mm-feature-transport cpu` to accept images (`cpu` transport is needed on
+GPUs without peer-to-peer access, such as PCIe consumer cards).
 
 ### INT4 on one 48 GB GPU (sm89)
 
@@ -75,7 +76,8 @@ docker run --rm --gpus '"device=0"' --ipc=host --network host --shm-size 32g \
 
 [`Blockway/Agens-Volundr-32B-Preview-INT4`](https://huggingface.co/Blockway/Agens-Volundr-32B-Preview-INT4)
 is compressed-tensors W4A16 (group size 128; the KDA projections and the vision tower stay bf16).
-Add `--enable-multimodal` for images. Tensor parallelism is bf16-only; serve INT4 at `--tp-size 1`.
+Add `--enable-multimodal --mm-feature-transport cpu` for images. Tensor parallelism is bf16-only; serve
+INT4 at `--tp-size 1`.
 
 ### bf16 on one H200 (sm90)
 
@@ -106,8 +108,11 @@ Add these flags to the two-GPU bf16 command above (text requests only — leave 
     --speculative-draft-model-path <drafter checkpoint> \
     --speculative-num-draft-tokens 8 \
     --speculative-draft-model-quantization unquant \
-    --mem-fraction-static 0.92 --max-mamba-cache-size 8 --max-running-requests 8 --cuda-graph-max-bs 8
+    --mem-fraction-static 0.93 --max-mamba-cache-size 4 --max-running-requests 4 --cuda-graph-max-bs 4
 ```
+
+(The drafter and its speculative state take memory from the KV cache; the slot counts above fit two
+48 GB cards.)
 
 Speculative decoding needs `--attention-backend flashinfer` on every GPU (the BCSA verify step is
 implemented there) and is served as a chain (top-k 1). The gain is largest at batch size 1 and on
@@ -143,6 +148,9 @@ curl -s http://127.0.0.1:30000/v1/chat/completions -H 'Content-Type: application
     {"type": "text", "text": "What is in this picture?"}]}]
 ```
 
+Token ids at or above 248,077 (beyond the tokenizer's vocabulary) are masked out of sampling; set
+`VOLUNDR_MASK_UNUSED_TOKENS=0` on the server to disable.
+
 `examples/smoke_test.py --base-url http://127.0.0.1:30000` runs all of the above against a server
 (add `--image-url URL` for the image check and `--speed` for a decode-speed estimate).
 
@@ -159,6 +167,7 @@ to every chat request that does not set its own.
 | `--attention-backend flashinfer` (sm89) / `fa3` (sm90) | FlashAttention's windowed kernel at head dim 256 does not run on sm89. Speculative decoding needs `flashinfer` everywhere. |
 | `--max-mamba-cache-size N` (sm89) | the KDA recurrent state is about 170 MB per request (85 MB per GPU at tensor parallel 2); without a cap SGLang's default sizing takes most of a 48 GB card for it. |
 | `--disable-custom-all-reduce` (multi-GPU without NVLink) | use NCCL all-reduce on PCIe-connected cards. |
+| `--mm-feature-transport cpu` (images, multi-GPU without peer access) | hand image features between processes through host memory instead of CUDA IPC. |
 | `--reasoning-parser agens --tool-call-parser agens` | parse the Agens control tokens (`<\|think\|>`, `<\|call\|>`). |
 
 ## Building
@@ -177,7 +186,7 @@ Build arguments:
 |---|---|---|
 | `BASE_IMAGE` | `lmsysorg/sglang:v0.5.16-cu129-runtime` | official SGLang image (CUDA 12.9, PyTorch 2.11) |
 | `SGLANG_COMMIT` | contents of `SGLANG_COMMIT` | upstream commit the patch applies to |
-| `CUDA_ARCH` | `sm89` | recorded in the image labels |
+| `CUDA_ARCH` | `sm89` | recorded in the image labels; the sm89 and sm90 images share every layer (the base image carries kernels for both) |
 | `PIP_INDEX_URL`, `RUSTUP_INIT_URL`, `RUSTUP_DIST_SERVER`, `RUSTUP_UPDATE_ROOT`, `CARGO_REGISTRY_MIRROR` | upstream | optional package mirrors |
 
 Without Docker, `scripts/apply_patch.sh DIR` checks out upstream SGLang at the pinned commit and applies
@@ -198,7 +207,10 @@ the patch; install it with `pip install -e DIR/python` into an environment match
 * Tensor parallelism is bf16-only; INT4 runs at tensor-parallel size 1.
 * No prefix caching (`--disable-radix-cache` is required).
 * Speculative decoding: chain only (top-k 1), FlashInfer backend, text requests.
-* Tested GPUs are 48 GB Ada cards and H200-class cards. 24 GB cards are not supported.
+* The first start of a container compiles a few kernels for the local GPU, which adds a few minutes
+  (most for INT4).
+* Video input is untested (the runtime image ships without FFmpeg).
+* 24 GB cards are not supported.
 
 ## License
 

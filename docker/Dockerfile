@@ -60,24 +60,34 @@ RUN set -eux; \
 
 COPY --from=sglang-src /sglang /build/sglang
 # Upstream does not commit a Cargo.lock for its Rust extension crates; patches/Cargo.lock pins the
-# dependency versions these images were built and tested with.
-COPY patches/agens-volundr.patch patches/Cargo.lock /build/
-RUN set -eux; \
-    cd /build/sglang; \
-    git apply --whitespace=nowarn /build/agens-volundr.patch; \
-    cp /build/Cargo.lock rust/Cargo.lock; \
-    test -f python/sglang/srt/models/volundr.py
+# dependency versions these images were built and tested with. The patch does not touch rust/, so
+# the extensions are built before it is applied (and stay cached when only the patch changes).
+COPY patches/Cargo.lock /build/sglang/rust/Cargo.lock
 
 RUN set -eux; \
     if [ -n "${RUSTUP_DIST_SERVER}" ]; then export RUSTUP_DIST_SERVER; fi; \
     if [ -n "${RUSTUP_UPDATE_ROOT}" ]; then export RUSTUP_UPDATE_ROOT; fi; \
     if [ -n "${PIP_INDEX_URL}" ]; then export PIP_INDEX_URL; fi; \
     python3 -m pip install --no-cache-dir "setuptools-rust>=1.10" "setuptools-scm>=8.0"; \
+    cargo fetch --manifest-path /build/sglang/rust/Cargo.toml; \
+    RUSTFLAGS="--remap-path-prefix=${CARGO_HOME}=/cargo --remap-path-prefix=/build/sglang=/sglang --remap-path-prefix=${RUSTUP_HOME}=/rustup"; \
+    for d in "${CARGO_HOME}"/registry/src/*; do \
+      RUSTFLAGS="${RUSTFLAGS} --remap-path-prefix=${d}=/cargo/registry/src/crates.io"; \
+    done; \
+    export RUSTFLAGS; \
     cd /build/sglang/python; \
     python3 setup.py build_rust --inplace --release; \
     rm -rf build ./*.egg-info; \
     find . -name '__pycache__' -type d -prune -exec rm -rf {} +; \
-    ls -la sglang/srt/grpc/_core*.so sglang/srt/multimodal/_core*.so sglang/srt/server/_core*.so
+    ls -la sglang/srt/grpc/_core*.so sglang/srt/multimodal/_core*.so sglang/srt/server/_core*.so; \
+    ! grep -a -l -e "${CARGO_HOME}/registry" sglang/srt/*/_core*.so
+
+COPY patches/agens-volundr.patch /build/agens-volundr.patch
+RUN set -eux; \
+    cd /build/sglang; \
+    git apply --whitespace=nowarn /build/agens-volundr.patch; \
+    find python -name '__pycache__' -type d -prune -exec rm -rf {} +; \
+    test -f python/sglang/srt/models/volundr.py
 
 # ---------------------------------------------------------------------------------------------------
 # wheels: FlashInfer 0.6.15.post1 (the version this SGLang commit requires; the base image has 0.6.14)
