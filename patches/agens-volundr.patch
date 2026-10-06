@@ -1680,7 +1680,7 @@ new file mode 100644
 index 0000000..6fa627a
 --- /dev/null
 +++ b/python/sglang/srt/models/volundr.py
-@@ -0,0 +1,1963 @@
+@@ -0,0 +1,1964 @@
 +"""Agens Volundr for SGLang.
 +
 +Volundr is a 72-layer hybrid language model with an optional vision tower:
@@ -2112,8 +2112,9 @@ index 0000000..6fa627a
 +_LN2 = 0.6931471805599453
 +# Own float workspace for the BCSA wrappers rather than sharing the backend's. Sharing is what
 +# sglang does across its own wrappers and is safe (runs are sequential), but it makes a BCSA plan
-+# able to overflow a workspace budgeted for the backend alone; 128 MB is cheap insurance.
-+_FI_WORKSPACE_BYTES = int(os.environ.get("VOLUNDR_FI_WORKSPACE_MB", "128")) * 1024 * 1024
++# able to overflow a workspace budgeted for the backend alone. The size a plan asks for grows with the
++# GPU's SM count: DFlash2 verify graphs (bs 4 x 8 draft tokens) need 141 MiB on a 188-SM card, so 256 MB.
++_FI_WORKSPACE_BYTES = int(os.environ.get("VOLUNDR_FI_WORKSPACE_MB", "256")) * 1024 * 1024
 +
 +
 +class _BcsaFlashInfer:

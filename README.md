@@ -11,6 +11,11 @@ plus the Dockerfile that builds the serving images. Prebuilt images:
 | `ghcr.io/blockwayz/agens-sglang:preview-sm89` | 48 GB Ada GPUs (sm89) |
 | `ghcr.io/blockwayz/agens-sglang:preview-sm90` | H100 / H200 (sm90) |
 
+Other GPUs: a user reports that `preview-sm89` runs unchanged on a 96 GB sm120 (Blackwell) workstation
+card (bf16, tensor-parallel 1, with the DFlash2 drafter)
+([discussion](https://huggingface.co/Blockway/Agens-Volundr-32B-Preview/discussions/1)). We have not
+tested Blackwell ourselves.
+
 ## What it adds
 
 * **Volundr model class** (`VolundrForConditionalGeneration`, `VolundrForCausalLM`) for SGLang's
@@ -106,7 +111,7 @@ slots. Two 48 GB GPUs, text requests only (no `--enable-multimodal`):
 
 ```bash
 docker run --rm --gpus '"device=0,1"' --ipc=host --network host --shm-size 32g \
-  -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True -e VOLUNDR_FI_WORKSPACE_MB=256 \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   ghcr.io/blockwayz/agens-sglang:preview-sm89 \
   python3 -m sglang.launch_server \
@@ -127,6 +132,13 @@ The drafter is [`Blockway/Agens-Volundr-32B-Preview-DFlash2`](https://huggingfac
 `expandable_segments` keep long-prompt prefill inside the remaining headroom. Speculative decoding needs
 `--attention-backend flashinfer` on every GPU (the BCSA verify step is implemented there) and is served
 as a chain (top-k 1). The gain is largest on predictable output (code, JSON).
+
+`VOLUNDR_FI_WORKSPACE_MB=256` is cheap insurance (one buffer shared by all BCSA layers). The FlashInfer
+workspace the BCSA verify step needs grows with the GPU's SM count and with the attention heads per GPU
+(tensor-parallel size 1 has twice as many as size 2): with the drafter at tensor-parallel 1 on a 188-SM
+card it needs 141 MiB, and the 128 MB default of the 2026-10-05 `preview` images fails during CUDA-graph
+capture with `aligned_alloc ... but only 134217728 bytes available`. Images built from this repository
+after 2026-10-06 default to 256 MB.
 
 ## Performance
 
@@ -166,6 +178,8 @@ curl -s http://127.0.0.1:30000/v1/chat/completions -H 'Content-Type: application
 
 # cap the thinking at 2,000 tokens; the model then writes its answer
   "reasoning_budget": 2000
+# with a max_tokens limit, set reasoning_budget below it (for example max_tokens - 4000) so that
+# a long thinking phase still ends in an answer instead of an empty reply
 
 # tools: standard OpenAI `tools`; calls come back in `message.tool_calls`
   "tools": [{"type": "function", "function": {"name": "get_weather", "parameters": {...}}}]
@@ -196,7 +210,8 @@ All default on; set to `0` on the server (`docker run -e NAME=0 ...`) to turn on
 
 The first three only change speed: each is bit-exact with the plain torch path it replaces, and greedy
 output is token-identical with them on or off. `VOLUNDR_REASONING_BUDGET=N` sets a default reasoning
-budget (see above).
+budget (see above). `VOLUNDR_FI_WORKSPACE_MB` (default 256; 128 in the 2026-10-05 `preview` images)
+sizes the FlashInfer workspace of the BCSA layers; see the speculative decoding section.
 
 ## Required flags
 
