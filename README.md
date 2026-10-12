@@ -8,8 +8,12 @@ plus the Dockerfile that builds the serving images. Prebuilt images:
 
 | image | GPUs |
 |---|---|
-| `ghcr.io/blockwayz/agens-sglang:preview-sm89` | 48 GB Ada GPUs (sm89) |
-| `ghcr.io/blockwayz/agens-sglang:preview-sm90` | H100 / H200 (sm90) |
+| `ghcr.io/blockwayz/agens-sglang:v1-sm89` | 48 GB Ada GPUs (sm89) |
+| `ghcr.io/blockwayz/agens-sglang:v1-sm90` | H100 / H200 (sm90) |
+
+`v1` (2026-10-12) adds [session continuation](#session-continuation-multi-turn-prefix-cache) and the
+256 MB FlashInfer workspace default; the earlier `preview` images (2026-10-05) are the same build
+without them.
 
 Other GPUs: a user reports that `preview-sm89` runs unchanged on a 96 GB sm120 (Blackwell) workstation
 card (bf16, tensor-parallel 1, with the DFlash2 drafter)
@@ -35,6 +39,9 @@ tested Blackwell ourselves.
   after N generated tokens, so the model always gets to its answer.
 * **Speculative decoding** for Volundr (chain verify across KDA, BCSA and Engram state) and the
   **DFlash2** drafter (`DFlash2DraftModel`, `--speculative-algorithm DFLASH`).
+* **Session continuation**: SGLang's radix prefix cache for multi-turn conversations, with the KDA
+  state and the Engram previous-token pair of the cached prefix carried into the follow-up request
+  (`VOLUNDR_RADIX_SESSION=1`; see [below](#session-continuation-multi-turn-prefix-cache)).
 * The published checkpoint is served **as shipped**: its `config.json` carries an `auto_map` for the
   transformers reference implementation, but SGLang uses its built-in Volundr classes and does not
   execute the checkpoint's Python code (`--trust-remote-code` is accepted and makes no difference).
@@ -49,7 +56,7 @@ explained [below](#required-flags); the server checks the Volundr-specific ones 
 ```bash
 docker run --rm --gpus '"device=0,1"' --ipc=host --network host --shm-size 32g \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
-  ghcr.io/blockwayz/agens-sglang:preview-sm89 \
+  ghcr.io/blockwayz/agens-sglang:v1-sm89 \
   python3 -m sglang.launch_server \
     --model-path Blockway/Agens-Volundr-32B-Preview \
     --tp-size 2 --attention-backend flashinfer --page-size 1 \
@@ -68,7 +75,7 @@ GPUs without peer-to-peer access, such as PCIe consumer cards).
 ```bash
 docker run --rm --gpus '"device=0"' --ipc=host --network host --shm-size 32g \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
-  ghcr.io/blockwayz/agens-sglang:preview-sm89 \
+  ghcr.io/blockwayz/agens-sglang:v1-sm89 \
   python3 -m sglang.launch_server \
     --model-path Blockway/Agens-Volundr-32B-Preview-INT4 \
     --tp-size 1 --attention-backend flashinfer --page-size 1 \
@@ -89,7 +96,7 @@ INT4 at `--tp-size 1`.
 ```bash
 docker run --rm --gpus '"device=0"' --ipc=host --network host --shm-size 32g \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
-  ghcr.io/blockwayz/agens-sglang:preview-sm90 \
+  ghcr.io/blockwayz/agens-sglang:v1-sm90 \
   python3 -m sglang.launch_server \
     --model-path Blockway/Agens-Volundr-32B-Preview \
     --tp-size 1 --attention-backend fa3 --page-size 1 \
@@ -113,7 +120,7 @@ slots. Two 48 GB GPUs, text requests only (no `--enable-multimodal`):
 docker run --rm --gpus '"device=0,1"' --ipc=host --network host --shm-size 32g \
   -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True -e VOLUNDR_FI_WORKSPACE_MB=256 \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
-  ghcr.io/blockwayz/agens-sglang:preview-sm89 \
+  ghcr.io/blockwayz/agens-sglang:v1-sm89 \
   python3 -m sglang.launch_server \
     --model-path Blockway/Agens-Volundr-32B-Preview \
     --tp-size 2 --attention-backend flashinfer --page-size 1 \
@@ -139,6 +146,60 @@ workspace the BCSA verify step needs grows with the GPU's SM count and with the 
 card it needs 141 MiB, and the 128 MB default of the 2026-10-05 `preview` images fails during CUDA-graph
 capture with `aligned_alloc ... but only 134217728 bytes available`. Images built from this repository
 after 2026-10-06 default to 256 MB.
+
+### Session continuation (multi-turn prefix cache)
+
+An agent sends the whole conversation again on every turn. With session continuation the server keeps
+SGLang's radix prefix cache on, so a follow-up turn prefills only the new messages. The KDA recurrent
+state and the Engram previous-token pair of the cached prefix are copied into the follow-up request
+(SGLang's mamba radix cache, `no_buffer` strategy); the BCSA per-token caches are addressed by token
+slot like K/V, so the radix tree keeps them as they are. It is off by default. Turn it on with the
+environment variable `VOLUNDR_RADIX_SESSION=1` and, in place of `--disable-radix-cache`,
+`--mamba-radix-cache-strategy no_buffer --disable-overlap-schedule`; without the variable the server
+refuses to start with the radix cache on.
+
+bf16 on two 48 GB GPUs:
+
+```bash
+docker run --rm --gpus '"device=0,1"' --ipc=host --network host --shm-size 32g \
+  -e VOLUNDR_RADIX_SESSION=1 \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  ghcr.io/blockwayz/agens-sglang:v1-sm89 \
+  python3 -m sglang.launch_server \
+    --model-path Blockway/Agens-Volundr-32B-Preview \
+    --tp-size 2 --attention-backend flashinfer --page-size 1 \
+    --mamba-radix-cache-strategy no_buffer --disable-overlap-schedule \
+    --disable-prefill-cuda-graph --disable-custom-all-reduce \
+    --mem-fraction-static 0.87 --context-length 65536 \
+    --max-mamba-cache-size 16 --max-running-requests 16 --cuda-graph-max-bs 16 \
+    --reasoning-parser agens --tool-call-parser agens \
+    --host 127.0.0.1 --port 30000
+```
+
+INT4 on one 48 GB GPU:
+
+```bash
+docker run --rm --gpus '"device=0"' --ipc=host --network host --shm-size 32g \
+  -e VOLUNDR_RADIX_SESSION=1 \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  ghcr.io/blockwayz/agens-sglang:v1-sm89 \
+  python3 -m sglang.launch_server \
+    --model-path Blockway/Agens-Volundr-32B-Preview-INT4 \
+    --tp-size 1 --attention-backend flashinfer --page-size 1 \
+    --mamba-radix-cache-strategy no_buffer --disable-overlap-schedule \
+    --disable-prefill-cuda-graph \
+    --mem-fraction-static 0.86 --context-length 32768 \
+    --max-mamba-cache-size 8 --max-running-requests 8 --cuda-graph-max-bs 8 \
+    --reasoning-parser agens --tool-call-parser agens \
+    --host 127.0.0.1 --port 30000
+```
+
+Measured effect: on a greedy replay of 20 multi-turn agent transcripts (484 turns, INT4 on one 48 GB
+GPU), follow-up turns ran 2.9× faster than with the radix cache off. Outputs are greedy-equivalent,
+not byte-identical: a cached prefix is prefilled in different pieces from a cold one, the same class
+of divergence as chunked prefill. Add `--enable-cache-report` to see the hit per request as
+`usage.prompt_tokens_details.cached_tokens`. Behind a load balancer, a conversation has to return to
+the same server for its cache to be used.
 
 ## Performance
 
@@ -210,7 +271,8 @@ All default on; set to `0` on the server (`docker run -e NAME=0 ...`) to turn on
 
 The first three only change speed: each is bit-exact with the plain torch path it replaces, and greedy
 output is token-identical with them on or off. `VOLUNDR_REASONING_BUDGET=N` sets a default reasoning
-budget (see above). `VOLUNDR_FI_WORKSPACE_MB` (default 256; 128 in the 2026-10-05 `preview` images)
+budget (see above). `VOLUNDR_RADIX_SESSION=1` (default off) enables
+[session continuation](#session-continuation-multi-turn-prefix-cache). `VOLUNDR_FI_WORKSPACE_MB` (default 256; 128 in the 2026-10-05 `preview` images)
 sizes the FlashInfer workspace of the BCSA layers; see the speculative decoding section.
 
 ## Required flags
@@ -218,7 +280,7 @@ sizes the FlashInfer workspace of the BCSA layers; see the speculative decoding 
 | flag | why |
 |---|---|
 | `--page-size 1` | BCSA reads pooled far-field K/V straight out of the token-indexed KV cache. |
-| `--disable-radix-cache` | Engram keeps the previous token ids of each request; a prefix-cache hit would resume a sequence whose ids were never seen. |
+| `--disable-radix-cache` | Engram keeps the previous token ids of each request; a prefix-cache hit would resume a sequence whose ids were never seen. The alternative is [session continuation](#session-continuation-multi-turn-prefix-cache) (`VOLUNDR_RADIX_SESSION=1` with `--mamba-radix-cache-strategy no_buffer --disable-overlap-schedule`), which carries that state along with the cached prefix. |
 | `--disable-prefill-cuda-graph` | the Engram and BCSA prefill paths are not graph-safe. Decode CUDA graphs stay on. |
 | `--attention-backend flashinfer` (sm89) / `fa3` (sm90) | FlashAttention's windowed kernel at head dim 256 does not run on sm89. Speculative decoding needs `flashinfer` everywhere. |
 | `--max-mamba-cache-size N` (sm89) | the KDA recurrent state is about 170 MB per request (85 MB per GPU at tensor parallel 2); without a cap SGLang's default sizing takes most of a 48 GB card for it. |
@@ -232,8 +294,8 @@ The images are built from the official SGLang runtime image; only Python sources
 small Rust extension modules are added, and every CUDA kernel is the base image's own build.
 
 ```bash
-docker build -f docker/Dockerfile --build-arg CUDA_ARCH=sm89 -t agens-sglang:preview-sm89 .
-docker build -f docker/Dockerfile --build-arg CUDA_ARCH=sm90 -t agens-sglang:preview-sm90 .
+docker build -f docker/Dockerfile --build-arg CUDA_ARCH=sm89 -t agens-sglang:v1-sm89 .
+docker build -f docker/Dockerfile --build-arg CUDA_ARCH=sm90 -t agens-sglang:v1-sm90 .
 ```
 
 Build arguments:
@@ -261,7 +323,8 @@ the patch; install it with `pip install -e DIR/python` into an environment match
 ## Limitations
 
 * Tensor parallelism is bf16-only; INT4 runs at tensor-parallel size 1.
-* No prefix caching (`--disable-radix-cache` is required).
+* Prefix caching only as [session continuation](#session-continuation-multi-turn-prefix-cache)
+  (off by default; otherwise `--disable-radix-cache` is required).
 * Speculative decoding: chain only (top-k 1), FlashInfer backend, text requests.
 * The first start of a container compiles a few kernels for the local GPU, which adds a few minutes
   (most for INT4).

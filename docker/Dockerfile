@@ -2,8 +2,8 @@
 # Agens SGLang: upstream SGLang at a pinned commit + patches/agens-volundr.patch, installed over the
 # official lmsysorg/sglang v0.5.16 (CUDA 12.9) runtime image.
 #
-#   docker build -f docker/Dockerfile --build-arg CUDA_ARCH=sm89 -t agens-sglang:preview-sm89 .
-#   docker build -f docker/Dockerfile --build-arg CUDA_ARCH=sm90 -t agens-sglang:preview-sm90 .
+#   docker build -f docker/Dockerfile --build-arg CUDA_ARCH=sm89 -t agens-sglang:v1-sm89 .
+#   docker build -f docker/Dockerfile --build-arg CUDA_ARCH=sm90 -t agens-sglang:v1-sm90 .
 #
 # On top of the base image this adds the patched SGLang Python tree, SGLang's three small Rust (PyO3)
 # extension modules built from source, and the official FlashInfer 0.6.15.post1 wheels that this
@@ -138,7 +138,7 @@ print('Volundr classes:', [c.__name__ for c in v.EntryClass])"
 # Declared after the layers above so the sm89 and sm90 images share them byte for byte.
 ARG CUDA_ARCH=sm89
 ARG SGLANG_COMMIT=4051b19cc2cd7fd8903ceec1d084a69b56c6df4d
-ARG AGENS_SGLANG_VERSION=preview
+ARG AGENS_SGLANG_VERSION=v1
 
 ENV AGENS_SGLANG_VERSION=${AGENS_SGLANG_VERSION} \
     AGENS_SGLANG_CUDA_ARCH=${CUDA_ARCH} \

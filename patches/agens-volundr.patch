@@ -1677,10 +1677,10 @@ index ffef278..b7de868 100644
 +]
 diff --git a/python/sglang/srt/models/volundr.py b/python/sglang/srt/models/volundr.py
 new file mode 100644
-index 0000000..6fa627a
+index 0000000..d2a890e
 --- /dev/null
 +++ b/python/sglang/srt/models/volundr.py
-@@ -0,0 +1,1964 @@
+@@ -0,0 +1,1999 @@
 +"""Agens Volundr for SGLang.
 +
 +Volundr is a 72-layer hybrid language model with an optional vision tower:
@@ -3044,6 +3044,36 @@ index 0000000..6fa627a
 +# graph's padding sentinel (-1) wraps onto.
 +_ENGRAM_PREV_ROWS = 32768
 +
++# ---- session continuation (VOLUNDR_RADIX_SESSION=1, 2026-10-10) ---------------------------------------
++# With the radix cache on, a prefix hit copies the cached node's mamba slot into the new request's slot
++# (copy-on-write in HybridReqToTokenPool.alloc -> MambaPool.copy_from). Engram's per-request previous-
++# token pair lives in a table keyed by that same slot, so it must travel with the copy, and a freshly
++# cleared slot must start from the no-token sentinel. The BCSA per-token caches (indexer keys, block keys)
++# are addressed by token slot like K/V, so the radix tree keeps them for free.
++_ENGRAM_SLOT_TENSORS: list = []
++
++
++def _install_engram_slot_hooks():
++    from sglang.srt.mem_cache.memory_pool import MambaPool
++    if getattr(MambaPool, "_volundr_engram_hooked", False):
++        return
++    _orig_copy = MambaPool.copy_from
++    _orig_clear = MambaPool.clear_slots
++
++    def copy_from(self, src_indices, dst_indices):
++        _orig_copy(self, src_indices, dst_indices)
++        for t in _ENGRAM_SLOT_TENSORS:
++            t[dst_indices.to(t.device).long()] = t[src_indices.to(t.device).long()]
++
++    def clear_slots(self, indices):
++        _orig_clear(self, indices)
++        for t in _ENGRAM_SLOT_TENSORS:
++            t[indices.to(t.device).long()] = -1
++
++    MambaPool.copy_from = copy_from
++    MambaPool.clear_slots = clear_slots
++    MambaPool._volundr_engram_hooked = True
++
 +
 +def _engram_rows(parts, rows: int) -> torch.Tensor:
 +    """Row index of the n-gram whose ids are `parts` (oldest first, int64, -1 = no token).
@@ -3255,10 +3285,15 @@ index 0000000..6fa627a
 +            seg = torch.searchsorted(qsl, ar, right=True) - 1     # token -> request row
 +            off = ar - qsl[seg]                            # offset inside this request's segment
 +            if not self._engram_slot_checked:
++                if os.environ.get("VOLUNDR_RADIX_SESSION", "0") == "1":
++                    _ENGRAM_SLOT_TENSORS.append(self.engram_prev)
++                    if getattr(self, "engram_draft", 0):
++                        _ENGRAM_SLOT_TENSORS.append(self.engram_cand)
++                    _install_engram_slot_hooks()
 +                if int(slots.max()) >= _ENGRAM_PREV_ROWS:
 +                    raise RuntimeError("mamba slot id exceeds the engram_prev table; enlarge _ENGRAM_PREV_ROWS")
 +                from sglang.srt.runtime_context import get_server_args
-+                if not get_server_args().disable_radix_cache:
++                if not get_server_args().disable_radix_cache and os.environ.get("VOLUNDR_RADIX_SESSION", "0") != "1":
 +                    raise RuntimeError(
 +                        "Engram serving requires --disable-radix-cache: a radix prefix hit resumes "
 +                        "a sequence whose previous token ids were never seeded in engram_prev, so "
