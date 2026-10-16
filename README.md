@@ -11,8 +11,9 @@ plus the Dockerfile that builds the serving images. Prebuilt images:
 | `ghcr.io/blockwayz/agens-sglang:v1-sm89` | 48 GB Ada GPUs (sm89) |
 | `ghcr.io/blockwayz/agens-sglang:v1-sm90` | H100 / H200 (sm90) |
 
-`v1` (2026-10-12) adds [session continuation](#session-continuation-multi-turn-prefix-cache) and the
-256 MB FlashInfer workspace default; the earlier `preview` images (2026-10-05) are the same build
+`v1` (2026-10-16) adds [session continuation](#session-continuation-multi-turn-prefix-cache), the
+256 MB FlashInfer workspace default, tensor-parallel synchronisation of the sampled DFlash2 verify step and the
+[recommended serving configurations](#recommended-serving-configurations); the earlier `preview` images (2026-10-05) are the same build
 without them.
 
 Other GPUs: a user reports that `preview-sm89` runs unchanged on a 96 GB sm120 (Blackwell) workstation
@@ -201,6 +202,91 @@ of divergence as chunked prefill. Add `--enable-cache-report` to see the hit per
 `usage.prompt_tokens_details.cached_tokens`. Behind a load balancer, a conversation has to return to
 the same server for its cache to be used.
 
+## Recommended serving configurations
+
+Measured with `v1-sm89` on 48 GB GPUs with session continuation on (bf16 at tensor-parallel 2 on a
+pair, INT4 on a single card). "Sessions" are multi-turn agent conversations whose history grows to
+32K tokens; TTFT is the time to the first token of a new turn whose earlier history is already cached.
+
+**Pair of 48 GB GPUs, bf16, tensor parallel 2** — up to 12 concurrent requests, 122K-token KV pool:
+
+```bash
+docker run --rm --gpus '"device=0,1"' --ipc=host --network host --shm-size 32g \
+  -e VOLUNDR_RADIX_SESSION=1 -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  ghcr.io/blockwayz/agens-sglang:v1-sm89 \
+  python3 -m sglang.launch_server \
+    --model-path Blockway/Agens-Volundr-32B-Preview \
+    --tp-size 2 --attention-backend flashinfer --page-size 1 \
+    --mamba-radix-cache-strategy no_buffer --disable-overlap-schedule \
+    --disable-prefill-cuda-graph --disable-custom-all-reduce \
+    --mem-fraction-static 0.90 --context-length 131072 \
+    --max-mamba-cache-size 36 \
+    --reasoning-parser agens --tool-call-parser agens \
+    --host 127.0.0.1 --port 30000
+```
+
+**Single 48 GB GPU, INT4** — 4 concurrent requests, 190K-token KV pool, a single 131K-token input fits:
+
+```bash
+docker run --rm --gpus '"device=0"' --ipc=host --network host --shm-size 32g \
+  -e VOLUNDR_RADIX_SESSION=1 -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  ghcr.io/blockwayz/agens-sglang:v1-sm89 \
+  python3 -m sglang.launch_server \
+    --model-path Blockway/Agens-Volundr-32B-Preview-INT4 \
+    --tp-size 1 --attention-backend flashinfer --page-size 1 \
+    --mamba-radix-cache-strategy no_buffer --disable-overlap-schedule \
+    --disable-prefill-cuda-graph \
+    --mem-fraction-static 0.86 --context-length 131072 \
+    --max-mamba-cache-size 12 --max-running-requests 4 \
+    --reasoning-parser agens --tool-call-parser agens \
+    --host 127.0.0.1 --port 30000
+```
+
+On one card `--mem-fraction-static 0.90` runs out of memory on long prefills; 0.86 is the tested value.
+
+Measured results:
+
+| setup | concurrent requests | KV pool (tokens) | 131K single input | 4 × 32K sessions | 6 × 32K sessions | TTFT at 30K / 60K / 100K history |
+|---|---|---|---|---|---|---|
+| pair bf16, mamba 36, no drafter | 12 | 122,003 | no (max 121,997) | OK, median 1.61 s | OK, median 1.65 s | 2.3 / 3.1 / 29 s |
+| pair bf16, mamba 12, max-running 4, drafter | 4 | 13,487 | no | fails (35 of 66 turns abort) | — | — |
+| 1 card INT4, mamba 12, max-running 4, no drafter | 4 | 190,338 | OK (TTFT 206 s) | OK, median 5.1 s | — | 2.8 / 4.3 / 42 s |
+| same, `--chunked-prefill-size 1024` | 4 | 190,338 | — | OK, median 7.3 s | — | 1.0 / 0.9 / 42 s |
+| 1 card INT4, mamba 6, max-running 2, drafter | 2 | 74,242 | no | 2 sessions OK, median 5.1 s | — | 2.8 / 4.4 s |
+| 1 card INT4, mamba 12, max-running 4, drafter | 4 | 33,798 | no | completes but evicts history (median 8.3 s) | — | — |
+
+The 100K TTFT values come from a single transcript; treat them as indicative only.
+
+**Drafter: 1–2 streams only.** Neither 48 GB setup can run the DFlash2 drafter with 4 or more concurrent
+32K sessions: on the pair each GPU holds 32 GB of bf16 weights plus the drafter and 3.2 GB of
+speculative state, leaving 13.5K tokens of KV; on the single card the drafter's speculative state is
+6.3 GB at 4 running requests and 3.8 GB at 2. Use the no-drafter commands above for session serving.
+For one user, take the pair command and add `--max-mamba-cache-size 3 --max-running-requests 1
+--cuda-graph-max-bs 1` plus the `--speculative-*` flags from the
+[speculative decoding section](#speculative-decoding-with-the-dflash2-drafter-single-user); at one slot
+the drafter still leaves a 74K-token KV pool on the pair, and single-stream decode measured 1.6–2.0×
+faster than without it (bf16 pair, greedy, 512 new tokens: chat 23 → 39 tok/s, code 24 → 49, tool
+calls 24 → 50, agent turns with 8K context 22 → 43; long free-form prose gains least, 24 → 32).
+
+**Memory arithmetic (slots, context, concurrency):**
+
+* With `no_buffer`, each running request holds **3 state slots**, so `--max-running-requests` is capped
+  at `--max-mamba-cache-size / 3`.
+* One slot costs 0.161 GB on the single card (0.081 GB per GPU on the pair); one KV token costs
+  68.7 KB on the single card (34.3 KB per GPU on the pair).
+* **Each extra concurrent request = 3 state slots ≈ 7K tokens of KV pool** on either setup
+  (0.48 GB on the single card, 0.24 GB per GPU on the pair). Example: on the single card, mamba 48
+  (16 requests) leaves a 131K pool; mamba 12 (4 requests) at the same memory fraction leaves 216K.
+* The longest single input is bounded by the KV pool, not by `--context-length`: a 131K input needs a
+  pool of at least 131,072 + 6 tokens. On the pair at mem 0.90 that means mamba ≤ 30 (about 136K pool;
+  33 gives about 129K). The single-card command above has headroom.
+* **Chunk size trade-off.** `no_buffer` snapshots the recurrent state only at chunk boundaries, so a
+  cached prefix is always a multiple of `--chunked-prefill-size` and each new turn re-prefills up to one
+  chunk. With the default 4096, mid-length TTFT is up to about 3–4 s; with 1024 it is about 1 s, but
+  long cold prefills are slower and TTFT under load rises (median 7.3 s vs 5.1 s at 4 sessions).
+
 ## Performance
 
 Measured with this image on 48 GB Ada GPUs (single stream: 256 new tokens after a prompt of the given
@@ -272,7 +358,12 @@ All default on; set to `0` on the server (`docker run -e NAME=0 ...`) to turn on
 The first three only change speed: each is bit-exact with the plain torch path it replaces, and greedy
 output is token-identical with them on or off. `VOLUNDR_REASONING_BUDGET=N` sets a default reasoning
 budget (see above). `VOLUNDR_RADIX_SESSION=1` (default off) enables
-[session continuation](#session-continuation-multi-turn-prefix-cache). `VOLUNDR_FI_WORKSPACE_MB` (default 256; 128 in the 2026-10-05 `preview` images)
+[session continuation](#session-continuation-multi-turn-prefix-cache). With the DFlash2 drafter at
+tensor-parallel size 2, `VOLUNDR_DFLASH_TP_SYNC` (default on) broadcasts the accepted draft length and
+bonus token from rank 0 after each sampled (temperature > 0) verify step, so the ranks cannot drift
+apart on a sampling difference and deadlock; `VOLUNDR_DFLASH_TP_CHECK=1` (default off) additionally
+gathers the per-rank verify results and batch composition every step and logs any disagreement
+(`[dflash-tp]`; diagnostic only, costs a collective per step). `VOLUNDR_FI_WORKSPACE_MB` (default 256; 128 in the 2026-10-05 `preview` images)
 sizes the FlashInfer workspace of the BCSA layers; see the speculative decoding section.
 
 ## Required flags

@@ -4147,10 +4147,16 @@ index 246b7a1..fa9e1a9 100644
 +        EPS=eps,
 +    )
 diff --git a/python/sglang/srt/speculative/dflash_worker_v2.py b/python/sglang/srt/speculative/dflash_worker_v2.py
-index 58a3a11..3121fc4 100644
+index 58a3a11..e408161 100644
 --- a/python/sglang/srt/speculative/dflash_worker_v2.py
 +++ b/python/sglang/srt/speculative/dflash_worker_v2.py
-@@ -36,6 +36,7 @@ from sglang.srt.speculative.dflash_utils import (
+@@ -1,4 +1,5 @@
+ import logging
++import os
+ import math
+ from dataclasses import replace
+ from typing import List, Optional
+@@ -36,6 +37,7 @@ from sglang.srt.speculative.dflash_utils import (
      can_dflash_use_fused_qkv_proj,
      compute_dflash_correct_drafts_and_bonus,
      compute_dflash_sampling_correct_drafts_and_bonus,
@@ -4158,7 +4164,7 @@ index 58a3a11..3121fc4 100644
      is_dflash_sampling_verify_available,
      parse_dflash_draft_config,
  )
-@@ -151,6 +152,51 @@ class _DflashDraftSampler:
+@@ -151,6 +153,107 @@ class _DflashDraftSampler:
          self.out[:n].copy_(selected.view(-1))
  
  
@@ -4176,6 +4182,62 @@ index 58a3a11..3121fc4 100644
 +        anchor_token_ids=anchor_token_ids,
 +    )
 +
++
++
++_TP_CHECK = os.environ.get("VOLUNDR_DFLASH_TP_CHECK", "0") == "1"
++_TP_SYNC = os.environ.get("VOLUNDR_DFLASH_TP_SYNC", "1") == "1"
++_tp_stats = {"steps": 0, "diverged": 0}
++
++
++def _tp_check_batch(batch, device):
++    if not _TP_CHECK:
++        return
++    group = get_tp_group()
++    if group.world_size == 1:
++        return
++    import zlib
++    reqs = list(batch.reqs)
++    rid = sum(zlib.crc32(str(r.rid).encode()) for r in reqs) % (1 << 52)
++    ntok = sum(len(r.origin_input_ids) + len(r.output_ids) for r in reqs)
++    fin = sum(1 for r in reqs if r.finished())
++    row = torch.tensor([len(reqs), rid, ntok, fin], dtype=torch.float64, device=device)
++    allr = torch.empty((group.world_size, 4), dtype=torch.float64, device=device)
++    torch.distributed.all_gather_into_tensor(allr, row, group=group.device_group)
++    _tp_stats["bsteps"] = _tp_stats.get("bsteps", 0) + 1
++    if bool((allr != allr[:1]).any()):
++        _tp_stats["bdiv"] = _tp_stats.get("bdiv", 0) + 1
++        logger.warning(f"[dflash-tp] rank {group.rank_in_group}: verify step {_tp_stats['bsteps']} BATCH differs "
++                       f"across ranks [bs, rid hash, tokens, finished] = {allr.tolist()}; "
++                       f"diverged batches {_tp_stats['bdiv']}/{_tp_stats['bsteps']}")
++    elif _tp_stats["bsteps"] % 2000 == 0 and group.rank_in_group == 0:
++        logger.info(f"[dflash-tp] {_tp_stats['bsteps']} verify steps, batch diverged {_tp_stats.get('bdiv', 0)}")
++
++
++def _tp_sync_sampled_verify(worker, accept_len, bonus, u, uf, candidates, logits):
++    group = get_tp_group()
++    if group.world_size == 1:
++        return
++    if _TP_CHECK:
++        f = lambda t: t.float().reshape(t.shape[0], -1).double().sum(dim=1)
++        row = torch.stack([accept_len.double(), bonus.double(), f(u) + f(uf[:, None]), f(candidates),
++                           f(logits.view(accept_len.shape[0], -1))], dim=1).contiguous()  # [bs, 5]
++        allr = torch.empty((group.world_size,) + tuple(row.shape), dtype=row.dtype, device=row.device)
++        torch.distributed.all_gather_into_tensor(allr, row, group=group.device_group)
++        _tp_stats["steps"] += 1
++        diff = (allr != allr[:1]).any(dim=0)  # [bs, 5]
++        if bool(diff.any()):
++            _tp_stats["diverged"] += 1
++            cols = ["accept_len", "bonus", "uniforms", "candidates", "logits"]
++            what = sorted({cols[j] for j in diff.nonzero()[:, 1].tolist()})
++            logger.warning(f"[dflash-tp] rank {group.rank_in_group}: step {_tp_stats['steps']} ranks differ in "
++                           f"{what}; diverged steps {_tp_stats['diverged']}/{_tp_stats['steps']} "
++                           f"(sync {'on' if _TP_SYNC else 'off'})")
++        elif _tp_stats["steps"] % 2000 == 0 and group.rank_in_group == 0:
++            logger.info(f"[dflash-tp] {_tp_stats['steps']} sampled verify steps, {_tp_stats['diverged']} diverged")
++    if _TP_SYNC:
++        src_rank = group.ranks[0]
++        torch.distributed.broadcast(accept_len, src=src_rank, group=group.device_group)
++        torch.distributed.broadcast(bonus, src=src_rank, group=group.device_group)
 +
 +class _SelectorDraftSampler:
 +    """DFlash2: selector decode folded into the draft cuda graph. The walk is always
@@ -4210,7 +4272,7 @@ index 58a3a11..3121fc4 100644
  class DFlashWorkerV2(BaseSpecWorker):
      """DFLASH speculative decoding worker (spec-v2).
  
-@@ -196,6 +242,8 @@ class DFlashWorkerV2(BaseSpecWorker):
+@@ -196,6 +299,8 @@ class DFlashWorkerV2(BaseSpecWorker):
          self.draft_model_runner = bundle.draft_model_runner
          self._draft_sampler = None
          self.draft_model = bundle.draft_model
@@ -4219,7 +4281,7 @@ index 58a3a11..3121fc4 100644
          draft_config = parse_dflash_draft_config(
              draft_hf_config=self.draft_model_runner.model_config.hf_config
          )
-@@ -215,6 +263,9 @@ class DFlashWorkerV2(BaseSpecWorker):
+@@ -215,6 +320,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                      self.block_size,
                      model_block_size,
                  )
@@ -4229,7 +4291,7 @@ index 58a3a11..3121fc4 100644
          self.speculative_num_draft_tokens = int(self.block_size)
  
          self._mask_token = draft_config.mask_token
-@@ -369,6 +420,21 @@ class DFlashWorkerV2(BaseSpecWorker):
+@@ -369,6 +477,21 @@ class DFlashWorkerV2(BaseSpecWorker):
          lm_head = getattr(target_model, "lm_head", None)
          if lm_head is None or not hasattr(lm_head, "weight"):
              return _eager("no target lm_head")
@@ -4251,7 +4313,7 @@ index 58a3a11..3121fc4 100644
          if not torch.is_floating_point(lm_head.weight):
              # Quantized lm_head (FP8/INT) would break the static matmul.
              return _eager("quantized lm_head")
-@@ -797,6 +863,37 @@ class DFlashWorkerV2(BaseSpecWorker):
+@@ -797,6 +920,37 @@ class DFlashWorkerV2(BaseSpecWorker):
  
          return int(resolved_id)
  
@@ -4289,7 +4351,7 @@ index 58a3a11..3121fc4 100644
      def _greedy_sample_from_vocab_parallel_head(
          self,
          *,
-@@ -1622,6 +1719,14 @@ class DFlashWorkerV2(BaseSpecWorker):
+@@ -1622,6 +1776,14 @@ class DFlashWorkerV2(BaseSpecWorker):
              draft_next = self._draft_sampler.out[
                  : bs * (int(self.block_size) - 1)
              ].view(bs, int(self.block_size) - 1)
@@ -4304,6 +4366,32 @@ index 58a3a11..3121fc4 100644
          else:
              draft_hidden = draft_logits_output.hidden_states
              if draft_hidden is None:
+@@ -1718,18 +1880,25 @@ class DFlashWorkerV2(BaseSpecWorker):
+ 
+         candidates = draft_tokens
+         new_seq_lens = None
++        _tp_check_batch(batch, device)
+         if (
+             sampling_info is not None
+             and not sampling_info.is_all_greedy
+             and is_dflash_sampling_verify_available()
+         ):
++            _u = torch.rand((bs, int(self.block_size)), dtype=torch.float32, device=device)
++            _uf = torch.rand((bs,), dtype=torch.float32, device=device)
+             accept_len, bonus = compute_dflash_sampling_correct_drafts_and_bonus(
+                 candidates=candidates,
+                 next_token_logits=logits_output.next_token_logits,
+                 sampling_info=sampling_info,
+                 max_top_k=draft_input.max_top_k,
+                 uniform_top_k_value=draft_input.uniform_top_k_value,
++                uniform_samples=_u,
++                uniform_samples_for_final_sampling=_uf,
+             )
++            _tp_sync_sampled_verify(self, accept_len, bonus, _u, _uf, candidates,
++                                    logits_output.next_token_logits)
+             commit_lens = accept_len.to(torch.int32) + 1  # [bs]
+             out_tokens = torch.empty(
+                 (bs, int(self.block_size)), dtype=torch.int64, device=device
 diff --git a/python/sglang/srt/utils/hf_transformers/common.py b/python/sglang/srt/utils/hf_transformers/common.py
 index 8479f1e..1c6508a 100644
 --- a/python/sglang/srt/utils/hf_transformers/common.py
