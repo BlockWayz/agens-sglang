@@ -16,10 +16,15 @@ plus the Dockerfile that builds the serving images. Prebuilt images:
 [recommended serving configurations](#recommended-serving-configurations); the earlier `preview` images (2026-10-05) are the same build
 without them.
 
-Other GPUs: a user reports that `preview-sm89` runs unchanged on a 96 GB sm120 (Blackwell) workstation
-card (bf16, tensor-parallel 1, with the DFlash2 drafter)
-([discussion](https://huggingface.co/Blockway/Agens-Volundr-32B-Preview/discussions/1)). We have not
-tested Blackwell ourselves.
+Other GPUs: users report that the `sm89` images run unchanged on 96 GB sm120 (Blackwell) workstation
+cards — `preview-sm89` on the Preview
+([discussion](https://huggingface.co/Blockway/Agens-Volundr-32B-Preview/discussions/1)) and `v1-sm89`
+on v1 (bf16, tensor-parallel 1, 251K-token prefill at ~880 tok/s;
+[discussion](https://huggingface.co/Blockway/Agens-Volundr-32B-v1/discussions/1)). We have not tested
+Blackwell ourselves and there is no dedicated sm120 image yet. On 96 GB cards use tensor-parallel 1 per
+card; if you run `--tp-size 2` across two 96 GB cards, cap the CUDA-graph and request counts
+(`--cuda-graph-max-bs 8 --max-running-requests 8 --mem-fraction-static 0.85`) — graph capture at the
+default batch size is what runs out of memory there.
 
 ## What it adds
 
